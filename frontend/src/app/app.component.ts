@@ -273,7 +273,12 @@ export class AppComponent implements OnInit {
   cancelKeyEdit(): void { this.keyEditVersion++; this.editingKey = null; this.focusId('managed-keys-title'); }
   saveKey(): void {
     if (!this.editingKey) return; const key = this.editingKey; const version = this.keyEditVersion; if (this.keySaves.has(version)) return;
-    const draft = JSON.stringify([this.editKeyName, this.editModelIds, this.editRpm, this.editExpiry]); const parsedExpiry = this.editExpiry ? parseLocalTime(this.editExpiry) : null; if (this.editExpiry && !parsedExpiry) { this.error = '만료 시각을 YYYY-MM-DD:HHmm 형식의 유효한 현지 시간으로 입력하세요.'; return; } const expires = parsedExpiry?.toISOString() ?? null; this.keySaves.add(version); this.error = '';
+    const draft = JSON.stringify([this.editKeyName, this.editModelIds, this.editRpm, this.editExpiry]);
+    const parsedExpiry = this.editExpiry ? parseLocalTime(this.editExpiry) : null;
+    if (this.editExpiry && !parsedExpiry) { this.error = '만료 시각을 YYYY-MM-DD:HHmm 형식의 유효한 현지 시간으로 입력하세요.'; return; }
+    // A minute-precision display must not alter seconds or an ambiguous DST instant when untouched.
+    const expires = key.expires_at && this.editExpiry === formatLocalTime(key.expires_at) ? key.expires_at : parsedExpiry?.toISOString() ?? null;
+    this.keySaves.add(version); this.error = '';
     this.http.put('/admin/api-keys/' + key.id, {name: this.editKeyName, model_ids: [...this.editModelIds], requests_per_minute: this.editRpm, expires_at: expires}, {headers: this.headers()}).pipe(timeout({first: this.managementTimeoutMs}), finalize(() => this.update(() => this.keySaves.delete(version)))).subscribe({
       next: () => {this.keySaves.delete(version); if (this.drawer === 'editKey' && version === this.keyEditVersion && draft === JSON.stringify([this.editKeyName, this.editModelIds, this.editRpm, this.editExpiry])) this.closeDrawer(); this.refreshKeys(); this.refreshObservability(); this.update(() => {this.error = ''; this.message = `${key.name} 키 권한을 저장했습니다.`;});},
       error: failure => this.update(() => {if (version === this.keyEditVersion) this.error = this.uncertainSave(failure) ? '키 권한 변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 화면을 새로고침해 키 권한을 확인하세요.' : '키 권한 변경에 실패했습니다.';})

@@ -41,6 +41,17 @@ assert.equal(component.editingKey?.id, 2);
 assert.equal(component.editKeyName, 'new unsaved name');
 console.log('A completed model or key save does not close another selection.');
 
+const originalExpiry = '2026-11-01T06:30:42.123Z';
+component.editKey({...key(3), expires_at:originalExpiry});
+component.editKeyName = 'renamed'; component.saveKey();
+assert.equal(requests.at(-1)?.body.expires_at, originalExpiry);
+requests.at(-1)!.result.next({}); requests.at(-1)!.result.complete();
+component.editKey({...key(3), expires_at:originalExpiry});
+component.editExpiry = '2030-12-31:2359'; component.saveKey();
+assert.equal(requests.at(-1)?.body.expires_at, new Date(2030, 11, 31, 23, 59).toISOString());
+requests.at(-1)!.result.next({}); requests.at(-1)!.result.complete();
+console.log('Unchanged expiry preserves the original instant; an edited expiry uses local time.');
+
 async function savesDoNotOverlap(): Promise<void> {
   (component as any).managementTimeoutMs = 10;
   component.editModel(a); component.addModel(); const modelRequest = requests.length;
