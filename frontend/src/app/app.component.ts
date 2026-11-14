@@ -9,26 +9,14 @@ import { SessionLifecycle, revokeSession } from './session-lifecycle';
 interface Provider { id: string; name: string; adapter: string; base_url: string | null }
 interface Catalog { providers: Provider[]; operations: string[] }
 interface Connection { id: number; name: string; provider_type: string; configured: boolean; active: boolean }
-interface CredentialHealth {unreadable_count: number; providers: {provider_id: number; name: string; status: "not_configured" | "decryptable" | "unreadable"}[]}
 interface Capability {operation: string; api_mode: string; verification_status: string}
 interface Model { id: number; alias: string; provider: string; provider_id: number; upstream_model: string; operations: string[]; capabilities: Capability[]; verification_version: number; active: boolean; description: string | null; embedding_dimensions: number | null; embedding_space: string | null; supports_embedding_batch: boolean | null; embedding_max_batch_size: number | null; max_input_tokens: number | null; supports_streaming: boolean | null; supports_tools: boolean | null; supports_reasoning: boolean | null }
 interface Metrics {requests: number; attempts: number; unique_requests: number; retry_attempts: number; success: number; errors: number; interrupted: number; started: number; unknown: number; average_duration_ms: number | null; max_duration_ms: number | null}
-interface OperationalStatus {database_size_bytes: number | null; size_warning_bytes: number | null; size_warning: boolean | null; stale_after_minutes: number; stale_count_warning: number; stale_started_requests: number; stale_pending_reservations: number; stale_warning: boolean; checked_at: string}
 interface UsageSummary {operation: string; status: string; model_id: number; client_key_id: number; requests: number; input_tokens: number | null; output_tokens: number | null; input_token_records: number; output_token_records: number; question_count: number | null; currency: string | null; estimated_cost: string | null; cost_records: number}
 interface UsageRequest { provider_id_snapshot: number | null; provider_name_snapshot: string | null; provider_type_snapshot: string | null; upstream_model_snapshot: string | null;request_id: string; root_request_id: string; attempt_number: number; client_key_id: number; model_id: number; operation: string; requested_alias: string | null; status: string; started_at: string; estimated_cost: string | null; currency: string | null; resolved_at: string | null; resolution_actor: string | null; resolution_note: string | null}
 interface AuditEntry {id: number; created_at: string; actor: string; action: string; target_type: string; target_id: string}
 interface ManagedKey { id: number; name: string; prefix: string; active: boolean; requests_per_minute: number | null; expires_at: string | null; model_ids: number[] }
-interface ModelPrice {id: number; model_id: number; operation: string | null; effective_from: string; currency: string; basis: string; pricing_version: number; input_per_million: string | null; output_per_million: string | null; per_question: string | null}
-interface Budget { client_key_id: number; currency: string; limit_amount: string; reserve_per_request: string; spent_amount: string; held_amount: string }
-interface Reservation { provider_id_snapshot: number | null; provider_name_snapshot: string | null; provider_type_snapshot: string | null; upstream_model_snapshot: string | null; request_id: string; root_request_id: string; attempt_number: number; client_key_id: number; model_id: number; requested_alias: string | null; reserved_amount: string; currency: string; request_status: string; pending_reason: string; missing_input_tokens: boolean; missing_output_tokens: boolean; operation: string; started_at: string; finished_at: string | null }
-interface AdjustmentHistory { request_id: string; status: string; settled_amount: string | null; reconciled_at: string | null; reconciliation_note: string | null; reconciliation_actor: string | null; reconciliation_forced: boolean | null; adjustments: {id: string; previous_amount: string; revised_amount: string; note: string; actor: string; created_at: string}[] }
-interface RouteTarget {model_id: number; priority: number; weight: number}
-interface ModelRoute {id: number; alias: string; operation: string; active: boolean; retry_on_failure: boolean; targets: RouteTarget[]}
-interface ModelCircuit {model_id: number; alias: string; operation: string; failure_count: number; cooling_down: boolean; open_until: string | null}
-interface RetentionPreview {usage_records: number; audit_records: number; usage_cutoff: string; audit_cutoff: string}
 interface OIDCStart {authorization_url: string; state: string; browser_secret: string}
-interface OIDCIdentity {id: number; issuer: string; subject: string; user_id: number}
-interface AdminUser { id: number; username: string; active: boolean }
 interface AdminSession {token: string; expires_at: string}
 interface IssuedKey { id: number; key: string }
 
@@ -65,40 +53,29 @@ export class AppComponent implements OnInit {
   private readonly cdr = inject(ChangeDetectorRef);
   private readonly sessionLifecycle = inject(SessionLifecycle);
   catalog: Catalog | null = null; catalogError = false; catalogLoading = false; modelError = false;
-  models: Model[] = []; connections: Connection[] = []; keys: ManagedKey[] = []; admins: AdminUser[] = []; rotateId: number | null = null; rotateSecret = '';
-  oidcEnabled = false; oidcIdentities: OIDCIdentity[] = []; identityUser: number | null = null; identitySubject = '';
+  models: Model[] = []; connections: Connection[] = []; keys: ManagedKey[] = []; rotateId: number | null = null; rotateSecret = '';
+  oidcEnabled = false;
   token = ''; tokenInput = ''; loginUsername = ''; loginPassword = ''; newUsername = ''; newPassword = ''; loggedIn = false; error = ''; message = ''; issuedKey = ''; logoutWarning = '';
-  credentialHealth: CredentialHealth | null = null;
   providerName = ''; providerType = 'exaone'; providerKey = ''; providerBase = '';
   get selectedProvider(): Provider | undefined { return this.catalog?.providers.find(p => p.id === this.providerType); }
   get selectedModelProvider(): Connection | undefined { return this.connections.find(p => p.id === this.providerId); }
   get isCodingModelProvider(): boolean { return ['kimi_coding_global', 'kimi_coding_china', 'zai_coding', 'bigmodel_coding'].includes(this.selectedModelProvider?.provider_type ?? ''); }
   get supportsDecision(): boolean { return ['typesafe', 'openai'].includes(this.selectedModelProvider?.provider_type ?? ''); }
-  private modelEditVersion = 0; private routeEditVersion = 0; private keyEditVersion = 0;
+  private modelEditVersion = 0; private keyEditVersion = 0;
   providerId: number | null = null; alias = ''; upstream = ''; generation = true; embedding = false; decision = false; editingModel: Model | null = null; modelOperationError = false; modelFilter = ''; modelDescription = ''; modelEmbeddingSpace = ''; modelMaxInput: number | null = null; modelDimensions: number | null = null; modelEmbeddingBatch: boolean | null = null; modelEmbeddingBatchMax: number | null = null; modelStreaming: boolean | null = null; modelTools: boolean | null = null; modelReasoning: boolean | null = null;
   get filteredModels(): Model[] { return this.modelFilter ? this.models.filter(m => m.operations.includes(this.modelFilter)) : this.models; }
   usageStart = ''; usageEnd = ''; requestRoot = ''; usageOperation = ''; usageStatus = ''; usageModel: number | null = null; usageKey: number | null = null;
   metrics: Metrics | null = null; usageSummaryLoading = false; usage: UsageSummary[] = []; usageRequests: UsageRequest[] = []; audit: AuditEntry[] = []; observationError = false;
-  usageHasMore = false; auditHasMore = false; reservationsHasMore = false; usageLoading = false; auditLoading = false; reservationsLoading = false;
-  private usageListVersion = 0; private auditListVersion = 0; private reservationListVersion = 0; private adjustmentVersion = 0; private operationalVersion = 0; private requestListParams = new HttpParams();
-  operational: OperationalStatus | null = null; storageThreshold: number | null = null; staleMinutes = 60; staleCount = 1; operationalError = false;
-  usageRetention = 90; auditRetention = 365; retentionPreview: RetentionPreview | null = null; retentionApplying = false;
-  private retentionVersion = 0; private previewRetentionDays: {usage_days: number; audit_days: number} | null = null;
-  routes: ModelRoute[] = []; editingRoute: ModelRoute | null = null; routeAlias = ''; routeOperation = 'generation'; routeTarget: number | null = null; routeTargets: RouteTarget[] = []; routeRetry = false; routeNotice = '';
-  modelCircuits: ModelCircuit[] = [];
-  private reconcileVersion = 0; reconcileSubmitting = false; adjustmentSubmitting = false; adjustmentNeedsRefresh = false;
-  budgetRows: Budget[] = []; pendingReservations: Reservation[] = []; budgetKey: number | null = null; budgetCurrency = 'USD'; budgetLimit = ''; budgetReserve = ''; selectedReservation: Reservation | null = null; settledAmount = ''; reconcileNote = ''; forceStarted = false;
-  adjustmentRequest = ''; adjustmentHistory: AdjustmentHistory | null = null; adjustmentAmount = ''; adjustmentNote = ''; adjustmentId = '';
+  usageHasMore = false; auditHasMore = false; usageLoading = false; auditLoading = false;
+  private usageListVersion = 0; private auditListVersion = 0; private requestListParams = new HttpParams();
   keyName = ''; modelIds: number[] = []; rpm: number | null = null; issuingKey = false; keyIssueUncertain = false;
   private keyIssueRequest: {signature: string; id: string} | null = null;
   editingKey: ManagedKey | null = null; editKeyName = ''; editModelIds: number[] = []; editRpm: number | null = null; editExpiry = '';
-  get priceOperations(): string[] { return this.models.find(m => m.id === this.priceModel)?.operations ?? []; }
-  priceModel: number | null = null; priceOperation = ''; prices: ModelPrice[] = []; priceCurrency = 'USD'; priceBasis = 'tokens'; inputPrice = ''; outputPrice = ''; questionPrice = '';
   private update(action: () => void): void { action(); this.cdr.markForCheck(); }
   private headers() { return { Authorization: `Bearer ${this.token}` }; }
   ngOnInit(): void {
     this.loadCatalog();
-    this.http.get<{enabled: boolean}>('/auth/oidc/config').subscribe({next: data => this.update(() => {this.oidcEnabled = data.enabled; if (data.enabled && this.loggedIn && this.token.startsWith('mga_')) this.refreshIdentities();})});
+    this.http.get<{enabled: boolean}>('/auth/oidc/config').subscribe({next: data => this.update(() => {this.oidcEnabled = data.enabled;})});
     if (window.location.pathname === '/oidc/callback') {
       const parameters = new URLSearchParams(window.location.search);
       const state = parameters.get('state'); const code = parameters.get('code');
@@ -118,14 +95,11 @@ export class AppComponent implements OnInit {
     });
   }
   startSso(): void { this.http.post<OIDCStart>('/auth/oidc/start', {}).subscribe({next: data => {sessionStorage.setItem('magpie_oidc_' + data.state, data.browser_secret); window.location.assign(data.authorization_url);}, error: () => this.update(() => this.error = 'SSO 로그인을 시작하지 못했습니다.')}); }
-  refreshIdentities(): void { if (!this.oidcEnabled || !this.token.startsWith('mga_')) return; this.http.get<OIDCIdentity[]>('/admin/oidc-identities', {headers:this.headers()}).subscribe({next:data => this.update(() => this.oidcIdentities = data), error:() => this.update(() => this.error = 'SSO 연결 목록을 불러오지 못했습니다.')}); }
-  linkIdentity(): void { this.http.post('/admin/oidc-identities', {user_id:this.identityUser, subject:this.identitySubject}, {headers:this.headers()}).subscribe({next:() => {this.identitySubject = ''; this.refreshIdentities(); this.refreshObservability();}, error:() => this.update(() => this.error = 'SSO 계정 연결에 실패했습니다.')}); }
-  unlinkIdentity(identity: OIDCIdentity): void { if (!confirm('이 SSO 계정 연결을 해제하시겠습니까?')) return; this.http.delete('/admin/oidc-identities/' + identity.id, {headers:this.headers()}).subscribe({next:() => {this.refreshIdentities(); this.refreshObservability();}, error:() => this.update(() => this.error = 'SSO 연결 해제에 실패했습니다.')}); }
-  login(): void { this.credentialHealth = null; this.error = ''; this.http.get<Connection[]>('/admin/providers', {headers: this.headers()}).subscribe({next: data => { this.connections = data; this.loggedIn = true; this.refreshModels(); this.refreshKeys(); this.refreshObservability(); this.cdr.markForCheck(); }, error: () => { this.logout(); this.error = '관리자 인증에 실패했습니다.'; this.cdr.markForCheck(); }}); }
+  login(): void { this.error = ''; this.http.get<Connection[]>('/admin/providers', {headers: this.headers()}).subscribe({next: data => { this.connections = data; this.loggedIn = true; this.refreshModels(); this.refreshKeys(); this.refreshObservability(); this.cdr.markForCheck(); }, error: () => { this.logout(); this.error = '관리자 인증에 실패했습니다.'; this.cdr.markForCheck(); }}); }
   authenticate(): void { const candidate = this.tokenInput; this.logout(); this.token = candidate; this.login(); }
   logout(): void {
     this.sessionLifecycle.end();
-    this.usageListVersion++; this.auditListVersion++; this.reservationListVersion++; this.adjustmentVersion++; this.operationalVersion++;
+    this.usageListVersion++; this.auditListVersion++;
     if (this.token.startsWith('mga_')) {
       revokeSession(this.http.delete('/admin/sessions/current', {headers: this.headers()}), () => this.update(() => {
         this.logoutWarning = '서버 세션 폐기를 확인하지 못했습니다. 다시 로그인해 계정 비밀번호를 변경하거나 관리자에게 세션 폐기를 요청하세요.';
@@ -133,30 +107,21 @@ export class AppComponent implements OnInit {
     }
     this.token = ''; this.tokenInput = ''; this.loggedIn = false;
     this.loginUsername = ''; this.loginPassword = ''; this.newUsername = ''; this.newPassword = '';
-    this.connections = []; this.models = []; this.keys = []; this.admins = []; this.oidcIdentities = [];
-    this.credentialHealth = null; this.rotateId = null; this.rotateSecret = '';
+    this.connections = []; this.models = []; this.keys = [];
+    this.rotateId = null; this.rotateSecret = '';
     this.providerName = ''; this.providerKey = ''; this.providerBase = ''; this.providerType = 'exaone';
     this.providerId = null; this.cancelModelEdit(); this.generation = true; this.embedding = false; this.decision = false;
     this.modelFilter = ''; this.modelOperationError = false; this.modelError = false;
     this.keyEditVersion++; this.editingKey = null; this.editKeyName = ''; this.editModelIds = []; this.editRpm = null; this.editExpiry = '';
     this.issuedKey = ''; this.keyName = ''; this.modelIds = []; this.rpm = null; this.issuingKey = false; this.keyIssueUncertain = false; this.keyIssueRequest = null;
-    this.identityUser = null; this.identitySubject = '';
-    this.routes = []; this.modelCircuits = []; this.cancelRoute();
-    this.priceModel = null; this.priceOperation = ''; this.prices = []; this.priceCurrency = 'USD'; this.priceBasis = 'tokens';
-    this.inputPrice = ''; this.outputPrice = ''; this.questionPrice = '';
-    this.budgetRows = []; this.pendingReservations = []; this.budgetKey = null; this.budgetCurrency = 'USD'; this.budgetLimit = ''; this.budgetReserve = '';
-    this.reconcileVersion++; this.reconcileSubmitting = false; this.adjustmentSubmitting = false; this.adjustmentNeedsRefresh = false; this.selectedReservation = null; this.settledAmount = ''; this.reconcileNote = ''; this.forceStarted = false;
-    this.adjustmentHistory = null; this.adjustmentRequest = ''; this.adjustmentAmount = ''; this.adjustmentNote = ''; this.adjustmentId = '';
     this.usageStart = ''; this.usageEnd = ''; this.requestRoot = ''; this.usageOperation = ''; this.usageStatus = ''; this.usageModel = null; this.usageKey = null;
     this.metrics = null; this.usageSummaryLoading = false; this.usage = []; this.usageRequests = []; this.audit = []; this.requestListParams = new HttpParams();
-    this.usageHasMore = false; this.auditHasMore = false; this.reservationsHasMore = false;
-    this.usageLoading = false; this.auditLoading = false; this.reservationsLoading = false; this.observationError = false;
-    this.operational = null; this.storageThreshold = null; this.staleMinutes = 60; this.staleCount = 1; this.operationalError = false;
-    this.usageRetention = 90; this.auditRetention = 365; this.retentionApplying = false; this.invalidateRetentionPreview();
+    this.usageHasMore = false; this.auditHasMore = false;
+    this.usageLoading = false; this.auditLoading = false; this.observationError = false;
     this.error = ''; this.message = '';
   }
   loginAccount(): void { const username = this.loginUsername, password = this.loginPassword; this.logout(); this.http.post<AdminSession>('/admin/sessions', {username, password}).subscribe({next: data => {this.token = data.token; this.loginPassword = ''; this.login();}, error: () => this.update(() => {this.loginPassword = ''; this.error = '계정 로그인에 실패했습니다.';})}); }
-  createAdmin(): void { const bootstrap = !this.token.startsWith('mga_'); this.http.post('/admin/users', {username: this.newUsername, password: this.newPassword}, {headers: this.headers()}).subscribe({next: () => {this.newUsername = ''; this.newPassword = ''; if (bootstrap) this.logout(); else {this.refreshAdmins(); this.refreshObservability();} this.update(() => this.message = bootstrap ? '계정을 생성했습니다. 계정으로 로그인하세요.' : '계정을 생성했습니다.');}, error: () => this.update(() => {this.newPassword = ''; this.error = '관리자 계정 생성에 실패했습니다.';})}); }
+  createAdmin(): void { const bootstrap = !this.token.startsWith('mga_'); this.http.post('/admin/users', {username: this.newUsername, password: this.newPassword}, {headers: this.headers()}).subscribe({next: () => {this.newUsername = ''; this.newPassword = ''; if (bootstrap) this.logout(); else {this.refreshObservability();} this.update(() => this.message = bootstrap ? '계정을 생성했습니다. 계정으로 로그인하세요.' : '계정을 생성했습니다.');}, error: () => this.update(() => {this.newPassword = ''; this.error = '관리자 계정 생성에 실패했습니다.';})}); }
   refreshModels(): void { this.http.get<Model[]>('/admin/models', {headers: this.headers()}).subscribe({next: data => {this.models = data; this.modelError = false; this.cdr.markForCheck();}, error: () => this.update(() => this.modelError = true)}); }
   addProvider(): void { this.error = ''; this.message = ''; this.http.post<Connection>('/admin/providers', {name: this.providerName, provider_type: this.providerType, api_key: this.providerKey || null, base_url: this.providerType === 'openai_compatible' ? this.providerBase : null}, {headers: this.headers()}).subscribe({next: () => {this.providerKey = ''; this.providerName = ''; this.message = '공급자를 등록했습니다.'; this.login(); this.cdr.markForCheck();}, error: () => {this.providerKey = ''; this.error = '공급자 등록에 실패했습니다.'; this.cdr.markForCheck();}}); }
   editModel(model: Model): void { this.modelEditVersion++; this.editingModel = model; this.providerId = model.provider_id; this.alias = model.alias; this.upstream = model.upstream_model; this.generation = model.operations.includes('generation'); this.embedding = model.operations.includes('embedding'); this.decision = model.operations.includes('decision'); this.modelDescription = model.description ?? ''; this.modelMaxInput = model.max_input_tokens; this.modelDimensions = model.embedding_dimensions; this.modelEmbeddingSpace = model.embedding_space ?? ''; this.modelEmbeddingBatch = model.supports_embedding_batch; this.modelEmbeddingBatchMax = model.embedding_max_batch_size; this.modelStreaming = model.supports_streaming; this.modelTools = model.supports_tools; this.modelReasoning = model.supports_reasoning; this.focusControl('alias'); }
@@ -177,81 +142,7 @@ export class AppComponent implements OnInit {
   private modelDraft() { const operations = [this.generation ? 'generation' : '', this.embedding ? 'embedding' : '', this.decision ? 'decision' : ''].filter(Boolean); return {alias: this.alias, upstream_model: this.upstream, provider_id: this.providerId, operations, description: this.modelDescription || null, max_input_tokens: this.modelMaxInput, embedding_dimensions: this.embedding ? this.modelDimensions : null, embedding_space: this.embedding ? (this.modelEmbeddingSpace || null) : null, supports_embedding_batch: this.embedding ? this.modelEmbeddingBatch : null, embedding_max_batch_size: this.embedding ? this.modelEmbeddingBatchMax : null, supports_streaming: this.modelStreaming, supports_tools: this.modelTools, supports_reasoning: this.modelReasoning}; }
   addModel(): void { if (!this.generation && !this.embedding && !this.decision) { this.modelOperationError = true; this.focusControl('generation'); return; } this.modelOperationError = false; const body = this.modelDraft(); const draft = JSON.stringify(body); this.error = ''; this.message = ''; const version = this.modelEditVersion; const request = this.editingModel ? this.http.put('/admin/models/' + this.editingModel.id, body, {headers: this.headers()}) : this.http.post('/admin/models', body, {headers: this.headers()}); request.subscribe({next: () => {this.message = `${body.alias} 모델을 저장했습니다.`; if (version === this.modelEditVersion && draft === JSON.stringify(this.modelDraft())) this.cancelModelEdit(); this.refreshModels(); this.refreshObservability(); this.cdr.markForCheck();}, error: () => this.update(() => this.error = '모델 설정과 작업 유형을 확인하세요.')}); }
 
-  refreshAdmins(): void { this.http.get<AdminUser[]>('/admin/users', {headers: this.headers()}).subscribe({next: data => this.update(() => this.admins = data), error: () => this.update(() => this.error = '관리자 목록을 불러오지 못했습니다.')}); }
-  toggleAdmin(user: AdminUser): void { if (!confirm(`${user.username} 계정을 ${user.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/users/' + user.id + '/active', {active: !user.active}, {headers: this.headers()}).subscribe({next: () => {this.refreshAdmins(); this.refreshObservability();}, error: () => this.update(() => this.error = '관리자 상태 변경에 실패했습니다. 마지막 활성 계정은 비활성화할 수 없습니다.')}); }
-  checkProviderCredentials(): void { this.credentialHealth = null; this.http.get<CredentialHealth>('/admin/provider-credential-health', {headers:this.headers()}).subscribe({next: data => this.update(() => this.credentialHealth = data), error: () => this.update(() => this.error = '저장된 키를 점검하지 못했습니다.')}); }
   rotateProvider(): void { this.http.put('/admin/providers/' + this.rotateId + '/key', {api_key: this.rotateSecret}, {headers: this.headers()}).subscribe({next: () => this.update(() => {this.rotateSecret = ''; this.message = '공급자 키를 등록했습니다.'; this.login();}), error: () => this.update(() => {this.rotateSecret = ''; this.error = '키 교체에 실패했습니다.';})}); }
-  refreshPrices(): void { this.http.get<ModelPrice[]>('/admin/prices', {headers:this.headers()}).subscribe({next:data => this.update(() => this.prices = data), error:() => this.update(() => this.error = '가격 이력을 불러오지 못했습니다.')}); }
-  addPrice(): void { const rates = this.priceBasis === 'tokens' ? {input_per_million: this.inputPrice, output_per_million: this.outputPrice} : {per_question: this.questionPrice}; this.http.post('/admin/prices', {model_id: this.priceModel, operation: this.priceOperation, currency: this.priceCurrency, basis: this.priceBasis, ...rates}, {headers: this.headers()}).subscribe({next: () => {this.refreshPrices(); this.refreshObservability(); this.update(() => this.message = '모델 가격을 등록했습니다.');}, error: () => this.update(() => this.error = '가격 설정을 확인하세요.')}); }
-  invalidateRetentionPreview(): void { this.retentionVersion++; this.retentionPreview = null; this.previewRetentionDays = null; }
-  previewRetention(): void {
-    this.invalidateRetentionPreview();
-    const version = this.retentionVersion;
-    const days = {usage_days: this.usageRetention, audit_days: this.auditRetention};
-    this.http.post<RetentionPreview>('/admin/retention/preview', days, {headers: this.headers()}).subscribe({
-      next: data => {if (version === this.retentionVersion && days.usage_days === this.usageRetention && days.audit_days === this.auditRetention) this.update(() => {this.previewRetentionDays = days; this.retentionPreview = data;});},
-      error: () => {if (version === this.retentionVersion) this.update(() => this.error = '보존 기간을 확인하세요.');}
-    });
-  }
-  applyRetention(): void {
-    const days = this.previewRetentionDays;
-    if (this.retentionApplying || !this.retentionPreview || !days || days.usage_days !== this.usageRetention || days.audit_days !== this.auditRetention) return;
-    if (!confirm(`요청 이력 ${days.usage_days}일, 감사 이력 ${days.audit_days}일 기준으로 오래된 이력을 영구 삭제하시겠습니까?`)) return;
-    this.retentionApplying = true;
-    this.http.post('/admin/retention/apply', days, {headers: this.headers()}).pipe(finalize(() => this.update(() => this.retentionApplying = false))).subscribe({
-      next: () => {this.invalidateRetentionPreview(); this.refreshObservability(); this.update(() => this.message = '보존 기간을 적용했습니다.');},
-      error: () => {this.invalidateRetentionPreview(); this.update(() => this.error = '이력 정리 결과를 확인하지 못했습니다. 내역을 확인한 뒤 다시 미리보기 하세요.');}
-    });
-  }
-  refreshRoutes(): void { this.http.get<ModelRoute[]>('/admin/routes', {headers: this.headers()}).subscribe({next: data => this.update(() => this.routes = data), error: () => this.update(() => this.error = '라우트 목록을 불러오지 못했습니다.')}); this.http.get<ModelCircuit[]>('/admin/model-circuits', {headers:this.headers()}).subscribe({next: data => this.update(() => this.modelCircuits = data), error: () => this.update(() => this.error = '모델 장애 상태를 불러오지 못했습니다.')}); }
-  refreshOperational(): void { const version = ++this.operationalVersion; this.http.get<OperationalStatus>('/admin/operational-status', {headers:this.headers()}).subscribe({next: data => {if (version === this.operationalVersion) this.update(() => {if (!this.operational) {this.storageThreshold = data.size_warning_bytes; this.staleMinutes = data.stale_after_minutes; this.staleCount = data.stale_count_warning;} this.operational = data; this.operationalError = false;});}, error: () => {if (version === this.operationalVersion) this.update(() => this.operationalError = true);}}); }
-  saveOperational(): void { this.http.put('/admin/operational-policy', {size_warning_bytes:this.storageThreshold, stale_after_minutes:this.staleMinutes, stale_count_warning:this.staleCount}, {headers:this.headers()}).subscribe({next: () => {this.operational = null; this.refreshOperational(); this.refreshObservability(); this.update(() => this.message = '운영 기준을 저장했습니다.');}, error: () => this.update(() => this.error = '운영 기준을 저장하지 못했습니다.')}); }
-  resetCircuit(circuit: ModelCircuit): void { if (!confirm(`${circuit.alias}의 장애 대기 상태를 초기화하시겠습니까?`)) return; this.http.delete('/admin/models/' + circuit.model_id + '/capabilities/' + circuit.operation + '/circuit', {headers:this.headers()}).subscribe({next: () => {this.refreshRoutes(); this.refreshObservability();}, error: () => this.update(() => this.error = '장애 상태 초기화에 실패했습니다.')}); }
-  addRouteTarget(): void { if (this.routeTarget === null) { this.routeNotice = '추가할 대상 모델을 선택하세요.'; this.focusControl('routeTarget'); return; } if (this.routeTargets.some(t => t.model_id === this.routeTarget)) { this.routeNotice = '이미 추가된 대상입니다.'; return; } const model = this.models.find(m => m.id === this.routeTarget); if (!model || !model.operations.includes(this.routeOperation)) { this.routeNotice = '선택한 모델이 이 작업 유형을 지원하지 않습니다.'; return; } this.routeTargets.push({model_id: this.routeTarget, priority: 0, weight: 1}); this.routeNotice = model.alias + ' 모델을 추가했습니다.'; }
-  removeRouteTarget(index: number): void { this.routeTargets.splice(index, 1); }
-  editRoute(route: ModelRoute): void { this.routeEditVersion++; this.editingRoute = route; this.routeAlias = route.alias; this.routeOperation = route.operation; this.routeRetry = route.retry_on_failure; this.routeTargets = route.targets.map(t => ({...t})); this.focusControl('routeAlias'); }
-  cancelRoute(): void { this.routeEditVersion++; this.editingRoute = null; this.routeAlias = ''; this.routeOperation = 'generation'; this.routeRetry = false; this.routeTarget = null; this.routeTargets = []; this.routeNotice = ''; }
-  saveRoute(): void { if (!this.routeTargets.length) { this.routeNotice = '대상 모델을 하나 이상 추가하세요.'; this.focusControl('routeTarget'); return; } if (this.routeTargets.some(t => !this.models.find(m => m.id === t.model_id)?.operations.includes(this.routeOperation))) { this.routeNotice = '대상 모델의 작업 유형을 확인하세요.'; return; } this.routeNotice = ''; const body = {alias: this.routeAlias, operation: this.routeOperation, retry_on_failure: this.routeRetry, targets: this.routeTargets.map(target => ({...target}))}; const draft = JSON.stringify(body); const version = this.routeEditVersion; const req = this.editingRoute ? this.http.put('/admin/routes/' + this.editingRoute.id, body, {headers:this.headers()}) : this.http.post('/admin/routes', body, {headers:this.headers()}); req.subscribe({next: () => {if (version === this.routeEditVersion && draft === JSON.stringify({alias:this.routeAlias, operation:this.routeOperation, retry_on_failure:this.routeRetry, targets:this.routeTargets})) this.cancelRoute(); this.refreshRoutes(); this.refreshObservability(); this.update(() => this.message = `${body.alias} 라우트를 저장했습니다.`);}, error: () => this.update(() => this.error = '라우트 별칭과 대상 모델의 작업 유형을 확인하세요.')}); }
-  toggleRoute(route: ModelRoute): void { if (!confirm(`${route.alias} 라우트를 ${route.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/routes/' + route.id + '/active', {active: !route.active}, {headers:this.headers()}).subscribe({next: () => {this.refreshRoutes(); this.refreshObservability();}, error: () => this.update(() => this.error = '라우트 상태 변경에 실패했습니다.')}); }
-  refreshBudgets(): void { const version = ++this.reservationListVersion; this.http.get<Budget[]>('/admin/budgets', {headers: this.headers()}).subscribe({next: data => {if (version === this.reservationListVersion) this.update(() => this.budgetRows = data);}, error: () => {if (version === this.reservationListVersion) this.update(() => this.error = '예산 목록을 불러오지 못했습니다.');}}); this.reservationsHasMore = false; this.reservationsLoading = false; this.http.get<Reservation[]>('/admin/budget-reservations', {headers: this.headers()}).subscribe({next: data => {if (version === this.reservationListVersion) this.update(() => {this.pendingReservations = data; this.reservationsHasMore = data.length === 100;});}, error: () => {if (version === this.reservationListVersion) this.update(() => this.error = '예약 내역을 불러오지 못했습니다.');}}); }
-  moreReservations(): void { const last = this.pendingReservations.at(-1); if (!last || this.reservationsLoading) return; const version = this.reservationListVersion; this.reservationsLoading = true; const params = new HttpParams().set('before_started_at', last.started_at).set('before_request_id', last.request_id); this.http.get<Reservation[]>('/admin/budget-reservations', {headers:this.headers(), params}).subscribe({next:data => {if (version === this.reservationListVersion) this.update(() => {this.pendingReservations = [...this.pendingReservations, ...data]; this.reservationsHasMore = data.length === 100; this.reservationsLoading = false;});}, error:() => {if (version === this.reservationListVersion) this.update(() => {this.reservationsLoading = false; this.error = '이전 예약 내역을 불러오지 못했습니다.';});}}); }
-  setBudget(): void { this.http.put('/admin/api-keys/' + this.budgetKey + '/budget', {currency: this.budgetCurrency, limit_amount: this.budgetLimit, reserve_per_request: this.budgetReserve}, {headers: this.headers()}).subscribe({next: () => {this.refreshBudgets(); this.refreshObservability(); this.update(() => this.message = '예산을 저장했습니다.');}, error: () => this.update(() => this.error = '예산 설정에 실패했습니다. 통화는 변경할 수 없습니다.')}); }
-  reservationReason(reservation: Reservation): string {
-    const labels: Record<string, string> = {
-      in_progress_or_unfinished: '진행 중 또는 완료 기록 대기', result_unknown: '요청 결과 미확인',
-      request_failed: '요청 실패', request_interrupted: '요청 중단', usage_unavailable: '비용 산정에 필요한 사용량 미확인',
-      settlement_unresolved: '정산 상태 확인 필요',
-    };
-    return labels[reservation.pending_reason] ?? '정산 상태 확인 필요';
-  }
-  selectReservation(reservation: Reservation): void { this.reconcileVersion++; this.selectedReservation = reservation; this.settledAmount = ''; this.reconcileNote = ''; this.forceStarted = false; this.focusControl('settledAmount'); }
-  cancelReservation(): void { this.reconcileVersion++; this.selectedReservation = null; }
-  reconcileBudget(): void {
-    const selected = this.selectedReservation; if (!selected || this.reconcileSubmitting) return;
-    if ((selected.request_status === 'started' || selected.request_status === 'unknown') && !this.forceStarted) { this.error = '진행 중 또는 상태 미확인 요청은 강제 정산 확인이 필요합니다.'; return; }
-    if (!confirm(`요청 ${selected.request_id}을 확인한 금액으로 정산하시겠습니까?`)) return;
-    const version = this.reconcileVersion;
-    const body = {settled_amount:this.settledAmount, note:this.reconcileNote, force_started:this.forceStarted};
-    const draft = JSON.stringify(body);
-    this.reconcileSubmitting = true;
-    this.http.post('/admin/budget-reservations/' + encodeURIComponent(selected.request_id) + '/reconcile', body, {headers:this.headers()}).pipe(finalize(() => this.update(() => this.reconcileSubmitting = false))).subscribe({
-      next: () => {if (version === this.reconcileVersion && draft === JSON.stringify({settled_amount:this.settledAmount, note:this.reconcileNote, force_started:this.forceStarted})) this.cancelReservation(); this.refreshBudgets(); this.refreshObservability(); this.update(() => this.message = `요청 ${selected.request_id}을 정산했습니다.`);},
-      error: () => this.update(() => this.error = `요청 ${selected.request_id}의 정산 결과를 확인하지 못했습니다. 내역을 다시 확인하세요.`)
-    });
-  }
-  clearAdjustment(): void { this.adjustmentVersion++; this.adjustmentNeedsRefresh = false; this.adjustmentHistory = null; this.adjustmentId = ''; this.adjustmentAmount = ''; this.adjustmentNote = ''; }
-  loadAdjustments(): void { this.clearAdjustment(); const version = this.adjustmentVersion; const requestId = this.adjustmentRequest; this.http.get<AdjustmentHistory>('/admin/budget-reservations/' + encodeURIComponent(requestId) + '/adjustments', {headers: this.headers()}).subscribe({next: data => {if (version === this.adjustmentVersion && requestId === this.adjustmentRequest) this.update(() => {this.adjustmentHistory = data; this.adjustmentId = crypto.randomUUID();});}, error: () => {if (version === this.adjustmentVersion && requestId === this.adjustmentRequest) this.update(() => this.error = '예산 정산 내역을 찾지 못했습니다.');}}); }
-  adjustBudget(): void {
-    const history = this.adjustmentHistory; if (!history || history.settled_amount === null || this.adjustmentSubmitting || this.adjustmentNeedsRefresh) return;
-    if (!confirm(`요청 ${history.request_id}의 사용액을 확인한 청구 금액으로 수정하시겠습니까?`)) return;
-    const version = this.adjustmentVersion;
-    const body = {id:this.adjustmentId, expected_amount:history.settled_amount, revised_amount:this.adjustmentAmount, note:this.adjustmentNote};
-    this.adjustmentSubmitting = true;
-    this.http.post('/admin/budget-reservations/' + encodeURIComponent(history.request_id) + '/adjustments', body, {headers:this.headers()}).pipe(finalize(() => this.update(() => this.adjustmentSubmitting = false))).subscribe({
-      next: () => {this.refreshBudgets(); this.refreshObservability(); if (version === this.adjustmentVersion && this.adjustmentHistory?.request_id === history.request_id) {if (this.adjustmentAmount === body.revised_amount && this.adjustmentNote === body.note) this.loadAdjustments(); else this.adjustmentNeedsRefresh = true;} this.update(() => this.message = `요청 ${history.request_id}의 정산 금액을 수정했습니다.`);},
-      error: () => {if (version === this.adjustmentVersion && (this.adjustmentAmount !== body.revised_amount || this.adjustmentNote !== body.note)) this.adjustmentNeedsRefresh = true; this.update(() => this.error = `요청 ${history.request_id}의 수정 결과를 확인하지 못했습니다. 같은 내용으로 재시도하거나 내역을 다시 조회하세요.`);}
-    });
-  }
   refreshKeys(): void { this.http.get<ManagedKey[]>('/admin/api-keys', {headers: this.headers()}).subscribe({next: data => this.update(() => this.keys = data), error: () => this.update(() => this.error = '키 목록을 불러오지 못했습니다.')}); }
   editKey(key: ManagedKey): void { this.keyEditVersion++; this.editingKey = key; this.editKeyName = key.name; this.editModelIds = [...key.model_ids]; this.editRpm = key.requests_per_minute; if (key.expires_at) { const date = new Date(key.expires_at); this.editExpiry = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); } else this.editExpiry = ''; this.focusControl('editKeyName'); }
   cancelKeyEdit(): void { this.keyEditVersion++; this.editingKey = null; this.focusId('managed-keys-title'); }
@@ -260,7 +151,7 @@ export class AppComponent implements OnInit {
   removeProviderKey(provider: Connection): void { if (!confirm(`${provider.name}의 공급자 키를 제거하시겠습니까? 이미 진행 중인 요청은 계속될 수 있습니다.`)) return; this.http.delete('/admin/providers/' + provider.id + '/key', {headers:this.headers()}).subscribe({next: () => {this.message = '공급자 키를 제거했습니다.'; this.login();}, error: () => this.update(() => this.error = '공급자 키 제거에 실패했습니다.')}); }
   toggleProvider(provider: Connection): void { if (!confirm(`${provider.name} 공급자를 ${provider.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/providers/' + provider.id + '/active', {active: !provider.active}, {headers: this.headers()}).subscribe({next: () => this.login(), error: () => this.update(() => this.error = '공급자 상태 변경에 실패했습니다.')}); }
   toggleModel(model: Model): void { if (!confirm(`${model.alias} 모델을 ${model.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/models/' + model.id + '/active', {active: !model.active}, {headers: this.headers()}).subscribe({next: () => {this.refreshModels(); this.refreshObservability();}, error: () => this.update(() => this.error = '모델 상태 변경에 실패했습니다.')}); }
-  resolveUsage(record: UsageRequest): void { const note = prompt('실행이 더 이상 진행 중이 아님을 확인한 근거를 입력하세요. 예산 예약은 별도 정산해야 합니다.'); if (!note?.trim()) return; this.http.post('/admin/usage/requests/' + encodeURIComponent(record.request_id) + '/resolve', {note:note.trim()}, {headers:this.headers()}).subscribe({next: () => {this.refreshBudgets(); this.refreshObservability(); this.update(() => this.message = '요청을 결과 미확인으로 기록했습니다.');}, error: () => this.update(() => this.error = '요청을 정리하지 못했습니다. 현재 상태를 다시 확인하세요.')}); }
+  resolveUsage(record: UsageRequest): void { const note = prompt('실행이 더 이상 진행 중이 아님을 확인한 근거를 입력하세요. 예산 예약은 별도 정산해야 합니다.'); if (!note?.trim()) return; this.http.post('/admin/usage/requests/' + encodeURIComponent(record.request_id) + '/resolve', {note:note.trim()}, {headers:this.headers()}).subscribe({next: () => {this.refreshObservability(); this.update(() => this.message = '요청을 결과 미확인으로 기록했습니다.');}, error: () => this.update(() => this.error = '요청을 정리하지 못했습니다. 현재 상태를 다시 확인하세요.')}); }
   private focusId(id: string): void { requestAnimationFrame(() => document.getElementById(id)?.focus()); }
   private focusControl(name: string): void { requestAnimationFrame(() => document.querySelector<HTMLElement>('[name="' + name + '"]')?.focus()); }
   refreshObservability(): void {
@@ -268,7 +159,6 @@ export class AppComponent implements OnInit {
     const usageVersion = ++this.usageListVersion; const auditVersion = ++this.auditListVersion;
     this.usageHasMore = false; this.auditHasMore = false; this.usageLoading = false; this.auditLoading = false;
     this.metrics = null; this.usage = []; this.usageRequests = []; this.usageSummaryLoading = true;
-    this.refreshOperational();
     let params = new HttpParams();
     if (this.usageStart) params = params.set('start', new Date(this.usageStart).toISOString());
     if (this.usageEnd) params = params.set('end', new Date(this.usageEnd).toISOString());
