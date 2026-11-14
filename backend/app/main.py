@@ -2017,7 +2017,12 @@ async def test_registered_model(model_id: int, body: ModelTestIn, db: DB, actor:
             raise HTTPException(404, 'Active model not found')
         if operation not in {cap.operation for cap in row.capabilities}:
             raise HTTPException(422, 'Model does not support this operation')
-        config = upstream_config(row)
+        if not row.provider.encrypted_api_key:
+            raise HTTPException(400, 'provider_key_missing')
+        try:
+            config = upstream_config(row)
+        except HTTPException:
+            raise HTTPException(503, 'provider_config_unavailable') from None
         if operation == 'generation':
             request = ChatIn(model=row.alias, messages=[{'role':'user', 'content':'Reply with OK.'}], max_tokens=16)
         elif operation == 'embedding':
@@ -2069,9 +2074,14 @@ async def test_registered_model(model_id: int, body: ModelTestIn, db: DB, actor:
         raise
     except Exception as exc:
         await observability.finish(bind, request_id, started, 'error')
-        if isinstance(exc, (TimeoutError, providers.litellm.Timeout)) or getattr(exc, 'status_code', None) in (408, 504):
-            raise HTTPException(504, 'Provider test timed out', headers={'X-Request-ID':request_id}) from None
-        raise HTTPException(502, 'Provider test failed', headers={'X-Request-ID':request_id}) from None
+        upstream_status = getattr(exc, 'status_code', None)
+        if isinstance(exc, (TimeoutError, providers.litellm.Timeout)) or upstream_status in (408, 504):
+            raise HTTPException(504, 'provider_test_timeout', headers={'X-Request-ID':request_id}) from None
+        code = ('provider_test_authentication' if upstream_status in (401, 403) else
+                'provider_test_model_not_found' if upstream_status == 404 else
+                'provider_test_rate_limited' if upstream_status == 429 else
+                'provider_test_rejected' if upstream_status in (400, 422) else 'provider_test_failed')
+        raise HTTPException(502, code, headers={'X-Request-ID':request_id}) from None
     # Once the provider response has been validated, cancellation during the
     # shielded success finalization must not overwrite the success as interrupted.
     await observability.finish(bind, request_id, started, 'success', data.get('usage'))

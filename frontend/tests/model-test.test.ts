@@ -26,3 +26,7 @@ component.runModelTest(); component.logout(); requests[2].result.next({request_i
 assert.equal(component.testModel, null);
 assert.equal(component.testMessage, '');
 console.log('Explicit model tests suppress duplicates, report timeouts, and ignore stale responses.');
+component.selectModelTest(model); component.runModelTest(); requests[3].result.error({status:502,error:{detail:'provider_test_authentication'}});
+assert(component.testError.includes('인증'));
+component.runModelTest(); requests[4].result.error({status:502,error:{detail:'provider_test_model_not_found'}});
+assert(component.testError.includes('모델 ID'));

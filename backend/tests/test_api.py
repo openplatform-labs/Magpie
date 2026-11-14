@@ -3732,14 +3732,19 @@ def test_admin_model_test_sanitizes_provider_failure(context, monkeypatch):
 
 
 def test_admin_model_test_requires_active_model_and_key(context, monkeypatch):
-    client, _ = context
+    client, engine = context
     provider = client.post('/admin/providers', headers=admin(), json={'name':'no-key','provider_type':'exaone'}).json()['id']
     model = client.post('/admin/models', headers=admin(), json={'alias':'no-key-model','provider_id':provider,'upstream_model':'mock','operations':['generation']}).json()['id']
     calls = []
     async def fake(*args): calls.append(True)
     monkeypatch.setattr(providers, 'completion', fake)
     url = f'/admin/models/{model}/test'
-    assert client.post(url, headers=admin(), json={'operation':'generation'}).status_code == 503
+    assert client.post(url, headers=admin(), json={'operation':'generation'}).json()['detail'] == 'provider_key_missing'
+    with Session(engine) as session:
+        session.get(ProviderConnection, provider).encrypted_api_key = 'unreadable'
+        session.commit()
+    invalid = client.post(url, headers=admin(), json={'operation':'generation'})
+    assert invalid.status_code == 503 and invalid.json()['detail'] == 'provider_config_unavailable'
     assert client.put(f'/admin/providers/{provider}/key', headers=admin(), json={'api_key':'fake'}).status_code == 200
     assert client.put(f'/admin/models/{model}/active', headers=admin(), json={'active':False}).status_code == 200
     assert client.post(url, headers=admin(), json={'operation':'generation'}).status_code == 404
@@ -3982,3 +3987,22 @@ def test_openrouter_catalog_reports_incomplete_when_page_limit_is_reached(contex
     result = client.post(f'/admin/providers/{provider}/discover', headers=admin()).json()
     assert requests == list(range(0, 1000, 100))
     assert len(result['models']) == 1000 and result['partial'] is True
+
+
+@pytest.mark.parametrize(('upstream_status','detail'), [
+    (400,'provider_test_rejected'), (401,'provider_test_authentication'),
+    (403,'provider_test_authentication'), (404,'provider_test_model_not_found'),
+    (422,'provider_test_rejected'), (429,'provider_test_rate_limited'), (500,'provider_test_failed'),
+])
+def test_admin_model_test_classifies_upstream_errors_without_leaking_details(context, monkeypatch, upstream_status, detail):
+    client, _ = context
+    _, model_id, _ = configure(client, ['generation'])
+    class FakeProviderError(Exception):
+        status_code = upstream_status
+    async def fake(*args):
+        raise FakeProviderError('private provider error with secret')
+    monkeypatch.setattr(providers, 'completion', fake)
+    response = client.post(f'/admin/models/{model_id}/test', headers=admin(), json={'operation':'generation'})
+    assert response.status_code == 502 and response.json()['detail'] == detail
+    assert 'secret' not in response.text and 'X-Request-ID' in response.headers
+    assert client.get('/admin/usage/requests', headers=admin()).json()[0]['status'] == 'error'
