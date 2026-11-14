@@ -3428,3 +3428,49 @@ def test_gemini_embedding_usage_is_request_scoped(monkeypatch):
             return data.get('usage')
         return await asyncio.gather(*(one(v) for v in ('0','7','missing','12')))
     assert asyncio.run(run()) == [{'prompt_tokens':0}, {'prompt_tokens':7}, None, {'prompt_tokens':12}]
+
+
+def test_documented_api_examples_with_mock_providers(context, monkeypatch):
+    """The published requests remain executable without contacting a provider."""
+    import json
+    import re
+    from pathlib import Path
+
+    client, _ = context
+    text = (Path(__file__).resolve().parents[2] / 'docs/api-examples.md').read_text()
+    bodies = [json.loads(body) for body in re.findall(r"-d '([^']+)'", text)]
+    assert [body['model'] for body in bodies] == ['chat-main', 'embed-main', 'judge-main']
+    exaone = client.post('/admin/providers', headers=admin(), json={
+        'name':'example-exaone', 'provider_type':'exaone', 'api_key':'synthetic'}).json()['id']
+    jev = client.post('/admin/providers', headers=admin(), json={
+        'name':'example-jev', 'provider_type':'typesafe', 'api_key':'synthetic'}).json()['id']
+    model_ids = []
+    for alias, provider, operation in [('chat-main', exaone, 'generation'),
+                                       ('embed-main', exaone, 'embedding'),
+                                       ('judge-main', jev, 'decision')]:
+        response = client.post('/admin/models', headers=admin(), json={
+            'alias':alias, 'provider_id':provider, 'upstream_model':'example', 'operations':[operation]})
+        assert response.status_code == 201
+        model_ids.append(response.json()['id'])
+    issued = client.post('/admin/api-keys', headers=admin(), json={'name':'example', 'model_ids':model_ids})
+    assert issued.status_code == 201
+    auth = {'Authorization':'Bearer '+issued.json()['key']}
+
+    async def completion(config, data):
+        return {'choices':[{'index':0, 'message':{'role':'assistant','content':'mock'}, 'finish_reason':'stop'}],
+                'usage':{'prompt_tokens':2, 'completion_tokens':1}}
+    async def embedding(config, data):
+        return {'data':mock_vectors(data['input']), 'usage':{'prompt_tokens':2}}
+    async def decision(config, data):
+        return {'answers':[{'type':'predicate','name':data['questions'][0]['name'],'probability':0.75}],
+                'usage':{'input_tokens':2, 'output_tokens':1}}
+    monkeypatch.setattr(providers, 'completion', completion)
+    monkeypatch.setattr(providers, 'embedding', embedding)
+    monkeypatch.setattr(providers, 'decision', decision)
+    assert client.get('/v1/models', headers=auth).status_code == 200
+    for endpoint, body in zip(('/v1/chat/completions', '/v1/embeddings', '/v1/decisions'), bodies):
+        result = client.post(endpoint, headers=auth, json=body)
+        assert result.status_code == 200, result.text
+    usage = client.get('/admin/usage', headers=admin()).json()
+    assert {row['operation'] for row in usage} == {'generation', 'embedding', 'decision'}
+    assert all(row['requests'] == 1 and row['status'] == 'success' for row in usage)
