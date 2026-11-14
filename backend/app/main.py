@@ -2025,10 +2025,11 @@ async def test_registered_model(model_id: int, body: ModelTestIn, db: DB, actor:
             request = DecisionIn(model=row.alias, input='The sky is blue.', questions=[{'type':'predicate','name':'test','instructions':'Is the statement about the sky?'}])
         snapshot = {'provider_id_snapshot':row.provider.id, 'provider_type_snapshot':row.provider.provider_type,
                     'provider_name_snapshot':row.provider.name, 'upstream_model_snapshot':row.upstream_model}
+        dimensions = row.embedding_dimensions
         observability.audit(db, 'model.test', 'model', row.id, actor=actor)
         request_id, started = observability.begin(db, None, row.id, operation,
             1 if operation == 'decision' else None, row.pricing_version, row.alias, model_snapshot=snapshot)
-        return request, config, row.embedding_dimensions, snapshot, request_id, started
+        return request, config, dimensions, snapshot, request_id, started
     # A cancellation cannot abandon a DB worker that might already commit.
     pending = asyncio.create_task(asyncio.to_thread(prepare))
     try:

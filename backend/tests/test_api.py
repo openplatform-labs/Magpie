@@ -3755,3 +3755,130 @@ def test_admin_model_test_timeout_and_invalid_response(context, monkeypatch):
     response = client.post(f'/admin/models/{model}/test', headers=admin(), json={'operation':'generation'})
     assert response.status_code == 502 and 'secret' not in response.text
     assert [record['status'] for record in client.get('/admin/usage/requests', headers=admin()).json()] == ['error', 'error']
+
+
+def test_admin_model_test_does_not_hold_transaction_during_provider_call(context, monkeypatch):
+    import asyncio
+    from app.main import ModelTestIn, test_registered_model
+    client, engine = context
+    _, model_id, _ = configure(client, ['generation'])
+    async def run():
+        with Session(engine) as session:
+            async def fake(config, data):
+                assert not session.in_transaction()
+                return {'choices':[{'index':0,'message':{'role':'assistant','content':'OK'},'finish_reason':'stop'}]}
+            monkeypatch.setattr(providers, 'completion', fake)
+            result = await test_registered_model(model_id, ModelTestIn(operation='generation'), session, 'admin')
+            assert result['status'] == 'success'
+    asyncio.run(run())
+
+
+def test_admin_model_test_cancellation_during_recording_does_not_dispatch(context, monkeypatch):
+    import asyncio
+    import threading
+    from app import observability
+    from app.main import ModelTestIn, test_registered_model
+    client, engine = context
+    _, model_id, _ = configure(client, ['generation'])
+    entered, release = threading.Event(), threading.Event()
+    begin = observability.begin
+    def delayed_begin(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return begin(*args, **kwargs)
+    monkeypatch.setattr(observability, 'begin', delayed_begin)
+    calls = []
+    async def fake(*args): calls.append(True)
+    monkeypatch.setattr(providers, 'completion', fake)
+    async def run():
+        with Session(engine) as session:
+            task = asyncio.create_task(test_registered_model(model_id, ModelTestIn(operation='generation'), session, 'admin'))
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError): await task
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    records = client.get('/admin/usage/requests', headers=admin()).json()
+    assert not calls and len(records) == 1 and records[0]['status'] == 'interrupted'
+    assert records[0]['client_key_id'] is None
+
+
+def test_admin_model_test_cancellation_during_provider_call_is_recorded(context, monkeypatch):
+    import asyncio
+    from app.main import ModelTestIn, test_registered_model
+    client, engine = context
+    _, model_id, _ = configure(client, ['generation'])
+    async def run():
+        started = asyncio.Event()
+        async def fake(*args):
+            started.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(providers, 'completion', fake)
+        with Session(engine) as session:
+            task = asyncio.create_task(test_registered_model(model_id, ModelTestIn(operation='generation'), session, 'admin'))
+            await asyncio.wait_for(started.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError): await task
+    asyncio.run(run())
+    records = client.get('/admin/usage/requests', headers=admin()).json()
+    assert len(records) == 1 and records[0]['status'] == 'interrupted'
+
+
+def test_admin_model_test_does_not_call_provider_if_audit_fails(context, monkeypatch):
+    import asyncio
+    from app import observability
+    from app.main import ModelTestIn, test_registered_model
+    client, engine = context
+    _, model_id, _ = configure(client, ['generation'])
+    calls = []
+    async def fake(*args): calls.append(True)
+    def fail_audit(*args, **kwargs): raise RuntimeError('audit unavailable')
+    monkeypatch.setattr(providers, 'completion', fake)
+    monkeypatch.setattr(observability, 'audit', fail_audit)
+    async def run():
+        with Session(engine) as session:
+            with pytest.raises(RuntimeError, match='audit unavailable'):
+                await test_registered_model(model_id, ModelTestIn(operation='generation'), session, 'admin')
+    asyncio.run(run())
+    assert not calls
+
+
+def test_admin_model_test_success_not_overwritten_by_cancellation_during_finalization(context, monkeypatch):
+    import asyncio
+    import threading
+    from app import observability
+    from app.main import ModelTestIn, test_registered_model
+    client, engine = context
+    _, model_id, _ = configure(client, ['generation'])
+    entered, release = threading.Event(), threading.Event()
+    original_end = observability.end
+    statuses = []
+    def delayed_end(bind, request_id, started, status, usage=None):
+        statuses.append(status)
+        entered.set()
+        assert release.wait(5)
+        return original_end(bind, request_id, started, status, usage)
+    monkeypatch.setattr(observability, 'end', delayed_end)
+    async def fake(*args):
+        return {'choices':[{'index':0,'message':{'role':'assistant','content':'OK'},'finish_reason':'stop'}]}
+    monkeypatch.setattr(providers, 'completion', fake)
+    async def run():
+        with Session(engine) as session:
+            task = asyncio.create_task(test_registered_model(model_id, ModelTestIn(operation='generation'), session, 'admin'))
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError): await task
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert statuses == ['success']
+    assert client.get('/admin/usage/requests', headers=admin()).json()[0]['status'] == 'success'
