@@ -158,7 +158,16 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                             continue
                         seen.add(name)
                         label = item.get('displayName') if provider_type in ('gemini', 'fireworks_ai') else item.get('name')
-                        models.append({'id': name, 'name': label[:200] if isinstance(label, str) else name})
+                        model = {'id': name, 'name': label[:200] if isinstance(label, str) else name}
+                        # Only surface documented, explicitly advertised methods;
+                        # absence of metadata must not imply lack of support.
+                        methods = item.get('supportedGenerationMethods') if provider_type == 'gemini' else None
+                        if isinstance(methods, list) and all(isinstance(method, str) for method in methods):
+                            available = [operation for method, operation in
+                                         (('generateContent', 'generation'), ('embedContent', 'embedding')) if method in methods]
+                            if available:
+                                model['advertised_operations'] = available
+                        models.append(model)
                     more = bool(payload.get('has_more') or payload.get('nextPageToken'))
                     if partial or not more:
                         break

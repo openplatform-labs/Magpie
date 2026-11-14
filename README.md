@@ -10,6 +10,8 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 
 공급자 등록 후 ‘연결 테스트 및 모델 불러오기’를 누르면 저장된 키로 공급자의 모델 목록 API를 조회합니다. 목록에서 모델을 선택해 생성형, 판단형 또는 임베딩 작업을 지정하고 등록할 수 있습니다. 목록 조회만으로 추론 권한이나 모델별 기능이 보장되지는 않습니다. 목록 API를 제공하지 않거나 지원되지 않는 공급자는 모델 ID를 직접 입력하세요. EXAONE 모델 목록 경로는 OpenAI 호환 경로를 사용하지만 실제 서비스와의 호환성은 검증하지 않았습니다. 조회는 버튼을 누를 때만 실행되며 테스트에는 모의 응답을 사용합니다.
 
+Gemini 목록에서 공급자가 `generateContent` 또는 `embedContent`를 명시하면 해당 용도를 표시합니다. 이 표시는 목록 응답의 참고 정보이며, 등록자가 실제 사용할 용도를 직접 선택합니다. 다른 공급자나 메서드 정보가 없는 모델의 용도는 추측하지 않습니다.
+
 Cerebras와 Novita는 각각 공식 [Cerebras 모델 목록 API](https://inference-docs.cerebras.ai/api-reference/models/list-models)와 [Novita 모델 목록 API](https://docs.novita.ai/api-reference/model-apis-llm-list-models)를 사용합니다. Fireworks는 [계정별 모델 목록 API](https://docs.fireworks.ai/api-reference/list-models)에서 공개 `fireworks` 계정만 조회하므로 개인 계정 모델은 직접 등록해야 합니다. 이 공급자들의 실제 목록·추론 호출은 테스트하지 않았습니다.
 
 공급자 연결은 범용, 판단 전용 또는 임베딩 전용으로 구분합니다. 범용 연결에서는 신규 모델의 용도를 직접 선택해야 하며 전용 연결에는 해당 용도의 모델만 등록할 수 있습니다. 신규 모델은 생성형·판단형·임베딩 중 하나를 선택합니다. 기존에 여러 용도로 등록된 모델은 이관 시 유지됩니다. 관리자 API의 기존 클라이언트가 `model_group`을 생략하면 TypeSafe는 판단 전용, 그 밖의 공급자는 범용으로 등록합니다.

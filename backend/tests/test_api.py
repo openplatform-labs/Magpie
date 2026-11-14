@@ -3658,3 +3658,26 @@ def test_provider_group_change_preserves_models_and_rejects_conflicts(context):
     assert client.put(endpoint, headers=admin(), json={'model_group':'general'}).status_code == 200
     jev = client.post('/admin/providers', headers=admin(), json={'name':'jev-group','provider_type':'typesafe'}).json()['id']
     assert client.put(f'/admin/providers/{jev}/model-group', headers=admin(), json={'model_group':'general'}).status_code == 422
+
+
+def test_gemini_discovery_surfaces_only_explicit_supported_methods(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'gemini-methods','provider_type':'gemini','api_key':'fake'}).json()['id']
+    items = [
+        {'name':'models/chat', 'supportedGenerationMethods':['countTokens','generateContent']},
+        {'name':'models/embed', 'supportedGenerationMethods':['embedContent']},
+        {'name':'models/both', 'supportedGenerationMethods':['generateContent','embedContent']},
+        {'name':'models/unknown', 'supportedGenerationMethods':['futureMethod']},
+        {'name':'models/invalid', 'supportedGenerationMethods':['generateContent', None]},
+        {'name':'models/absent'},
+    ]
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={'models':items})), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 200
+    results = {item['id']:item for item in response.json()['models']}
+    assert results['chat']['advertised_operations'] == ['generation']
+    assert results['embed']['advertised_operations'] == ['embedding']
+    assert results['both']['advertised_operations'] == ['generation', 'embedding']
+    assert all('advertised_operations' not in results[name] for name in ('unknown','invalid','absent'))

@@ -37,3 +37,4 @@ assert(!component.registerableModelId('vendor/../model'));
 component.selectDiscovery({...exaone, configured:false}); component.discoverProvider();
 assert.equal(requests.length, 2);
 console.log('Discovery respects provider selection and sends selected models to the registration form.');
+assert.equal(component.advertisedOperationsLabel(['generation', 'embedding']), '생성형 / 임베딩');
