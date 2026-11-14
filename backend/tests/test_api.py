@@ -3682,22 +3682,30 @@ def test_provider_groups_enforce_model_purpose_without_network(context, monkeypa
                               ('embedding','openai/embed'), ('decision','typesafe/jev')]
 
 
-def test_provider_rename_preserves_model_and_records_only_success(context):
+def test_provider_rename_preserves_model_and_records_only_success(context, monkeypatch):
     client, _ = context
     first = client.post('/admin/providers', headers=admin(), json={'name':'original','provider_type':'exaone','api_key':'mock-secret'}).json()
     second = client.post('/admin/providers', headers=admin(), json={'name':'existing','provider_type':'exaone'}).json()
     model = client.post('/admin/models', headers=admin(), json={'alias':'rename-test','provider_id':first['id'],'upstream_model':'mock','operations':['generation']}).json()
+    async def fake_completion(config, data):
+        return {'choices':[{'index':0,'message':{'role':'assistant','content':'OK'},'finish_reason':'stop'}]}
+    monkeypatch.setattr(providers, 'completion', fake_completion)
+    test_url = f"/admin/models/{model['id']}/test"
+    assert client.post(test_url, headers=admin(), json={'operation':'generation'}).status_code == 200
     url = f"/admin/providers/{first['id']}/name"
     assert client.put(url, json={'name':'renamed'}).status_code == 401
     assert client.put(url, headers=admin(), json={'name':'existing'}).status_code == 409
     assert client.put(url, headers=admin(), json={'name':'renamed'}).status_code == 200
     assert client.put(url, headers=admin(), json={'name':'renamed'}).status_code == 200
+    assert client.post(test_url, headers=admin(), json={'operation':'generation'}).status_code == 200
     assert client.put(f"/admin/providers/{second['id'] + 999}/name", headers=admin(), json={'name':'missing'}).status_code == 404
     providers_list = client.get('/admin/providers', headers=admin()).json()
     assert next(p for p in providers_list if p['id'] == first['id'])['name'] == 'renamed'
     assert next(m for m in client.get('/admin/models', headers=admin()).json() if m['id'] == model['id'])['provider'] == 'renamed'
     events = [a for a in client.get('/admin/audit', headers=admin()).json() if a['action'] == 'provider.name.change']
     assert len(events) == 1
+    records = client.get('/admin/usage/requests', headers=admin()).json()
+    assert {record['provider_name_snapshot'] for record in records} == {'original', 'renamed'}
 
 
 def test_provider_group_change_preserves_models_and_rejects_conflicts(context):
