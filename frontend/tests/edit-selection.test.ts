@@ -40,3 +40,21 @@ component.saveKey(); component.editKeyName = 'new unsaved name'; requests[3].res
 assert.equal(component.editingKey?.id, 2);
 assert.equal(component.editKeyName, 'new unsaved name');
 console.log('A completed model or key save does not close another selection.');
+
+async function savesDoNotOverlap(): Promise<void> {
+  (component as any).managementTimeoutMs = 10;
+  component.editModel(a); component.addModel(); const modelRequest = requests.length;
+  component.addModel(); assert.equal(requests.length, modelRequest);
+  assert(component.modelSaving); component.closeDrawer(); assert.equal(component.drawer, 'model');
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert(!component.modelSaving); assert(component.error.includes('결과를 확인하지 못했습니다'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  component.editKey(key(1)); component.saveKey(); const keyRequest = requests.length;
+  component.saveKey(); assert.equal(requests.length, keyRequest);
+  assert(component.keySaving); component.closeDrawer(); assert.equal(component.drawer, 'editKey');
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert(!component.keySaving); assert(component.error.includes('결과를 확인하지 못했습니다'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  console.log('Model and key drawers prevent overlapping saves and report timeouts.');
+}
+savesDoNotOverlap().catch(error => { console.error(error); process.exitCode = 1; });
