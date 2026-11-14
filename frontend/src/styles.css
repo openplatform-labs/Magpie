@@ -47,3 +47,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .login-layout { max-width: 1040px; margin: 0 auto; padding: 90px 30px; display: grid; grid-template-columns: 1fr minmax(300px, 420px); gap: 70px; align-items: center; }.login-heading h1 { font-size: 40px; line-height: 1.25; }.login-card { margin: 0; padding: 32px; }.login-card details { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e1e9ed; }
 @media (max-width: 760px) { .topbar { padding: 0 18px; }.brand-caption { display:none; }.workspace { display: block; }.sidebar { display: flex; gap: 4px; padding: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #e0e8ec; }.sidebar p { display:none; }.sidebar button { width: auto; white-space: nowrap; }.workspace-main { padding: 28px 18px; }.stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.steps { grid-template-columns: 1fr; }.login-layout { grid-template-columns: 1fr; gap: 24px; padding: 42px 18px; }.login-heading h1 { font-size: 30px; } }
 @media (max-width: 760px) { .page-heading { gap: 12px; flex-wrap: wrap; } }
+
+/* Registration and editing take place in a right-hand drawer. */
+.drawer-layer { position: fixed; inset: 0; z-index: 1000; }
+.drawer-backdrop { position: absolute; inset: 0; background: rgba(13, 32, 46, .48); }
+.drawer.panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(560px, 100%); box-sizing: border-box; margin: 0; padding: 28px 32px 40px; border: 0; border-radius: 0; overflow-y: auto; box-shadow: -12px 0 36px rgba(15, 37, 51, .14); }
+.drawer-header { background: #fff; color: #1b2c3b; height: auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 18px; border-bottom: 1px solid #e1e9ed; }
+.drawer-header h2 { margin: 0; font-size: 20px; }
+.drawer-close { border: 0; background: transparent; color: #526b78; font-size: 28px; line-height: 1; cursor: pointer; }
+.drawer:focus { outline: none; }
+@media (max-width: 600px) { .drawer.panel { padding: 22px 20px 32px; } }
