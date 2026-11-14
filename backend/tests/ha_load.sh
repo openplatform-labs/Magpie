@@ -37,7 +37,12 @@ cleanup() { compose_test down -v --remove-orphans >/dev/null 2>&1 || :; rm -rf "
 trap cleanup EXIT HUP INT TERM
 compose_test up -d --no-build >/dev/null
 compose_test exec -T backend alembic upgrade head
-python3 backend/tests/ha_load_client.py
+if ! python3 backend/tests/ha_load_client.py; then
+  # This isolated stack contains synthetic credentials and provider responses.
+  # Preserve access/error logs before teardown so 502s can be attributed.
+  compose_test logs --no-color --tail=200 backend frontend >&2 || :
+  exit 1
+fi
 backend_ids=$(compose_test ps -q backend)
 [ "$(printf '%s\n' "$backend_ids" | wc -l | tr -d ' ')" = 2 ]
 exchanges=0

@@ -19,6 +19,14 @@ def request(method, path, token, body=None):
             content = response.read()
             return response.status, json.loads(content) if content else None
     except HTTPError as error:
+        if error.code == 502:
+            try:
+                parsed = json.loads(error.read())
+                detail = parsed.get('error', {}) if isinstance(parsed, dict) else {}
+                print('Unexpected 502:', {'type':detail.get('type'), 'code':detail.get('code'),
+                                          'request_id':error.headers.get('X-Request-ID')}, flush=True)
+            except (ValueError, AttributeError):
+                print('Unexpected 502: non-JSON proxy response', flush=True)
         return error.code, None
 
 
