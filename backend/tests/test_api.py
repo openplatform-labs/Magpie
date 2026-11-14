@@ -3608,10 +3608,10 @@ def test_discovered_model_id_with_variant_can_be_registered(context):
     assert response.json()['upstream_model'] == 'vendor/model:variant'
 
 
-def test_provider_groups_enforce_model_purpose_without_network(context):
+def test_provider_groups_enforce_model_purpose_without_network(context, monkeypatch):
     client, _ = context
     def connect(name, provider_type, group):
-        return client.post('/admin/providers', headers=admin(), json={'name':name, 'provider_type':provider_type, 'model_group':group})
+        return client.post('/admin/providers', headers=admin(), json={'name':name, 'provider_type':provider_type, 'model_group':group, 'api_key':'fake'})
     assert connect('bad-jev', 'typesafe', 'general').status_code == 422
     assert connect('bad-decision', 'exaone', 'decision').status_code == 422
     assert connect('bad-coding', 'zai_coding', 'embedding').status_code == 422
@@ -3620,7 +3620,8 @@ def test_provider_groups_enforce_model_purpose_without_network(context):
     decision = connect('decision', 'typesafe', 'decision').json()['id']
     def register(provider, alias, operations):
         return client.post('/admin/models', headers=admin(), json={'provider_id':provider, 'alias':alias, 'upstream_model':alias, 'operations':operations})
-    assert register(general, 'general-gen', ['generation']).status_code == 201
+    generative = register(general, 'general-gen', ['generation'])
+    assert generative.status_code == 201
     assert register(general, 'general-embed', ['embedding']).status_code == 201
     assert register(general, 'general-mixed', ['generation', 'embedding']).status_code == 422
     embedded = register(embedding, 'embed', ['embedding'])
@@ -3631,11 +3632,25 @@ def test_provider_groups_enforce_model_purpose_without_network(context):
     assert register(decision, 'jev-gen', ['generation']).status_code == 422
     groups = {item['name']:item['model_group'] for item in client.get('/admin/providers', headers=admin()).json()}
     assert groups == {'general':'general', 'embedding':'embedding', 'decision':'decision'}
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'purpose-check', 'model_ids':[embedded.json()['id'], jev.json()['id']]}).json()['key']
+    key = client.post('/admin/api-keys', headers=admin(), json={'name':'purpose-check', 'model_ids':[generative.json()['id'], embedded.json()['id'], jev.json()['id']]}).json()['key']
     auth = {'Authorization':'Bearer '+key}
-    for alias in ('embed', 'jev'):
-        response = client.post('/v1/chat/completions', headers=auth, json={'model':alias, 'messages':[{'role':'user', 'content':'test'}]})
-        assert response.status_code == 403
+    operations = {
+        'generation': ('/v1/chat/completions', {'messages':[{'role':'user', 'content':'test'}]}),
+        'embedding': ('/v1/embeddings', {'input':'test'}),
+        'decision': ('/v1/decisions', {'input':'test', 'questions':[{'type':'predicate','name':'ok','instructions':'Is this a test?'}]}),
+    }
+    upstream_calls = []
+    async def unexpected_call(*args, **kwargs):
+        upstream_calls.append(True)
+        raise AssertionError('An incompatible model reached a provider')
+    for name in ('completion', 'embedding', 'decision'):
+        monkeypatch.setattr(providers, name, unexpected_call)
+    for alias, allowed in [('general-gen','generation'), ('embed','embedding'), ('jev','decision')]:
+        for operation, (path, payload) in operations.items():
+            if operation != allowed:
+                response = client.post(path, headers=auth, json={'model':alias, **payload})
+                assert response.status_code == 403, (alias, operation, response.text)
+    assert not upstream_calls
 
 
 def test_provider_group_change_preserves_models_and_rejects_conflicts(context):
