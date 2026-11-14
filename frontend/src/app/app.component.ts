@@ -2,7 +2,7 @@ import { Component, OnInit, inject, ChangeDetectorRef } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { finalize } from 'rxjs';
+import { finalize, timeout } from 'rxjs';
 import { ClarityModule } from '@clr/angular';
 import { SessionLifecycle, revokeSession } from './session-lifecycle';
 
@@ -98,6 +98,7 @@ export class AppComponent implements OnInit {
   models: Model[] = []; connections: Connection[] = []; keys: ManagedKey[] = []; rotateId: number | null = null; rotateSecret = '';
   oidcEnabled = false;
   token = ''; tokenInput = ''; loginUsername = ''; loginPassword = ''; newUsername = ''; newPassword = ''; loggedIn = false; error = ''; message = ''; issuedKey = ''; logoutWarning = '';
+  readonly managementTimeoutMs = 60000;
   providerSaving = false; providerKeySaving = false;
   providerName = ''; providerType = 'exaone'; providerGroup: 'general' | 'decision' | 'embedding' = 'general'; providerKey = ''; providerBase = '';
   advertisedOperationsLabel(operations: string[]): string { return operations.map(operation => operation === 'generation' ? '생성형' : '임베딩').join(' / '); }
@@ -121,6 +122,7 @@ export class AppComponent implements OnInit {
   private keyIssueRequest: {signature: string; id: string} | null = null;
   editingKey: ManagedKey | null = null; editKeyName = ''; editModelIds: number[] = []; editRpm: number | null = null; editExpiry = '';
   private update(action: () => void): void { action(); this.cdr.markForCheck(); }
+  private uncertainSave(failure: any): boolean { return !failure?.status || failure.status === 408 || failure.status >= 500; }
   private headers() { return { Authorization: `Bearer ${this.token}` }; }
   ngOnInit(): void {
     this.loadCatalog();
@@ -178,9 +180,9 @@ export class AppComponent implements OnInit {
   addProvider(): void {
     if (this.providerSaving) return;
     this.providerSaving = true; this.error = ''; this.message = '';
-    this.http.post<Connection>('/admin/providers', {name: this.providerName, provider_type: this.providerType, model_group: this.providerGroup, api_key: this.providerKey || null, base_url: this.providerType === 'openai_compatible' ? this.providerBase : null}, {headers: this.headers()}).subscribe({
+    this.http.post<Connection>('/admin/providers', {name: this.providerName, provider_type: this.providerType, model_group: this.providerGroup, api_key: this.providerKey || null, base_url: this.providerType === 'openai_compatible' ? this.providerBase : null}, {headers: this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
       next: created => {this.providerSaving = false; this.providerKey = ''; this.providerName = ''; this.closeDrawer(); const connection = {...created, active:true}; this.connections = [...this.connections, connection]; this.selectDiscovery(connection); this.message = '공급자를 등록했습니다. 연결을 확인하거나 모델을 직접 등록하세요.'; this.login(); this.cdr.markForCheck();},
-      error: () => {this.providerSaving = false; this.providerKey = ''; this.error = '공급자 등록에 실패했습니다.'; this.cdr.markForCheck();}
+      error: failure => {this.providerSaving = false; this.providerKey = ''; this.error = this.uncertainSave(failure) ? '등록 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 화면을 새로고침해 공급자 목록을 확인하세요.' : '공급자 등록에 실패했습니다. 입력 내용과 이름 중복을 확인하세요.'; this.cdr.markForCheck();}
     });
   }
   get filteredDiscoveryModels(): DiscoveredModel[] { const query = this.discoveryFilter.trim().toLowerCase(); return (this.discoveryResult?.models ?? []).filter(item => !query || item.id.toLowerCase().includes(query || '') || item.name.toLowerCase().includes(query || '')); }
@@ -188,9 +190,9 @@ export class AppComponent implements OnInit {
   saveProviderGroup(): void {
     const provider = this.groupEditing; if (!provider || this.groupSaving) return;
     const version = this.groupEditVersion; const group = this.groupDraft; this.groupSaving = true; this.groupError = '';
-    this.http.put('/admin/providers/' + provider.id + '/model-group', {model_group:group}, {headers:this.headers()}).subscribe({
+    this.http.put('/admin/providers/' + provider.id + '/model-group', {model_group:group}, {headers:this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
       next: () => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.closeDrawer(); this.message = '공급자 그룹을 변경했습니다.'; this.login();}); },
-      error: failure => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.groupError = failure?.status === 409 ? '이 그룹과 다른 용도의 모델이 있습니다. 해당 모델을 먼저 다른 공급자 연결로 이동하세요.' : '그룹을 변경하지 못했습니다. 공급자와 그룹을 확인하세요.';}); }
+      error: failure => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.groupError = failure?.status === 409 ? '이 그룹과 다른 용도의 모델이 있습니다. 해당 모델을 먼저 다른 공급자 연결로 이동하세요.' : this.uncertainSave(failure) ? '변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 화면을 새로고침해 공급자 그룹을 확인하세요.' : '그룹을 변경하지 못했습니다. 공급자와 그룹을 확인하세요.';}); }
     });
   }
   selectDiscovery(provider: Connection): void {
@@ -248,9 +250,9 @@ export class AppComponent implements OnInit {
   rotateProvider(): void {
     if (this.providerKeySaving) return;
     this.providerKeySaving = true; this.error = '';
-    this.http.put('/admin/providers/' + this.rotateId + '/key', {api_key: this.rotateSecret}, {headers: this.headers()}).subscribe({
+    this.http.put('/admin/providers/' + this.rotateId + '/key', {api_key: this.rotateSecret}, {headers: this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
       next: () => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.closeDrawer(); this.message = '공급자 키를 등록했습니다.'; this.login();}),
-      error: () => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.error = '키 교체에 실패했습니다.';})
+      error: failure => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.error = this.uncertainSave(failure) ? '키 변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 감사 이력을 확인하세요.' : '키 교체에 실패했습니다.';})
     });
   }
   refreshKeys(): void { this.http.get<ManagedKey[]>('/admin/api-keys', {headers: this.headers()}).subscribe({next: data => this.update(() => this.keys = data), error: () => this.update(() => this.error = '키 목록을 불러오지 못했습니다.')}); }
@@ -292,5 +294,5 @@ export class AppComponent implements OnInit {
   moreUsage(): void { const last = this.usageRequests.at(-1); if (!last || this.usageLoading) return; const version = this.usageListVersion; this.usageLoading = true; const params = this.requestListParams.set('before_started_at', last.started_at).set('before_request_id', last.request_id); this.http.get<UsageRequest[]>('/admin/usage/requests', {headers:this.headers(), params}).subscribe({next:data => {if (version === this.usageListVersion) this.update(() => {this.usageRequests = [...this.usageRequests, ...data]; this.usageHasMore = data.length === 100; this.usageLoading = false;});}, error:() => {if (version === this.usageListVersion) this.update(() => {this.usageLoading = false; this.observationError = true;});}}); }
   moreAudit(): void { const last = this.audit.at(-1); if (!last || this.auditLoading) return; const version = this.auditListVersion; this.auditLoading = true; const params = new HttpParams().set('before_id', last.id); this.http.get<AuditEntry[]>('/admin/audit', {headers:this.headers(), params}).subscribe({next:data => {if (version === this.auditListVersion) this.update(() => {this.audit = [...this.audit, ...data]; this.auditHasMore = data.length === 100; this.auditLoading = false;});}, error:() => {if (version === this.auditListVersion) this.update(() => {this.auditLoading = false; this.observationError = true;});}}); }
   resetKeyIssueRequest(): void { if (this.issuingKey || !this.keyIssueUncertain) return; if (!confirm('이전 발급이 완료되었을 수 있습니다. 키 목록을 확인했으며 새 발급을 준비하시겠습니까?')) return; this.keyIssueRequest = null; this.keyIssueUncertain = false; this.error = ''; }
-  issueKey(): void { if (this.issuingKey) return; this.error = ''; this.issuingKey = true; const body = {name: this.keyName, model_ids: [...this.modelIds].sort((a,b) => a-b), requests_per_minute: this.rpm}; const signature = JSON.stringify(body); if (!this.keyIssueRequest || this.keyIssueRequest.signature !== signature) this.keyIssueRequest = {signature, id: crypto.randomUUID()}; const headers = {...this.headers(), 'Idempotency-Key': this.keyIssueRequest.id}; this.http.post<IssuedKey>('/admin/api-keys', body, {headers}).pipe(finalize(() => this.update(() => this.issuingKey = false))).subscribe({next: data => {this.keyIssueRequest = null; this.keyIssueUncertain = false; this.issuedKey = data.key; this.keyName = ''; this.modelIds = []; this.refreshKeys(); this.refreshObservability(); this.cdr.markForCheck(); this.focusId('issued-key-title');}, error: () => {this.update(() => {this.keyIssueUncertain = true; this.error = '키 발급 결과를 확인하지 못했습니다. 키 목록을 확인한 뒤 필요하면 새 발급 요청을 준비하세요.';}); this.refreshKeys();}}); }
+  issueKey(): void { if (this.issuingKey) return; this.error = ''; this.issuingKey = true; const body = {name: this.keyName, model_ids: [...this.modelIds].sort((a,b) => a-b), requests_per_minute: this.rpm}; const signature = JSON.stringify(body); if (!this.keyIssueRequest || this.keyIssueRequest.signature !== signature) this.keyIssueRequest = {signature, id: crypto.randomUUID()}; const headers = {...this.headers(), 'Idempotency-Key': this.keyIssueRequest.id}; this.http.post<IssuedKey>('/admin/api-keys', body, {headers}).pipe(timeout({first: this.managementTimeoutMs}), finalize(() => this.update(() => this.issuingKey = false))).subscribe({next: data => {this.keyIssueRequest = null; this.keyIssueUncertain = false; this.issuedKey = data.key; this.keyName = ''; this.modelIds = []; this.refreshKeys(); this.refreshObservability(); this.cdr.markForCheck(); this.focusId('issued-key-title');}, error: () => {this.update(() => {this.keyIssueUncertain = true; this.error = '키 발급 결과를 확인하지 못했습니다. 키 목록을 확인한 뒤 필요하면 새 발급 요청을 준비하세요.';}); this.refreshKeys();}}); }
 }

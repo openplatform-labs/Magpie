@@ -21,3 +21,19 @@ component.openDrawer('providerKey'); component.rotateId = 1; component.rotateSec
 assert.equal(requests.length, 3); component.closeDrawer(); assert.equal(component.drawer, 'providerKey');
 requests[2].result.next({}); assert.equal(component.drawer, null); assert.equal(component.rotateSecret, '');
 console.log('Provider drawer prevents duplicate submissions and stays open while saving.');
+
+async function timeoutReleasesDrawer(): Promise<void> {
+  (component as any).managementTimeoutMs = 10;
+  component.openDrawer('provider'); component.providerName = 'Slow'; component.addProvider();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(component.providerSaving, false);
+  assert(component.error.includes('결과를 확인하지 못했습니다'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  component.openDrawer('providerKey'); component.rotateProvider();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(component.providerKeySaving, false);
+  assert(component.error.includes('감사 이력'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  console.log('Timed-out provider writes release the drawer and report an uncertain outcome.');
+}
+timeoutReleasesDrawer().catch(error => { console.error(error); process.exitCode = 1; });

@@ -30,3 +30,14 @@ requests[2].result.next({id:1, model_group:'general'});
 assert.equal(refreshes, 1);
 assert.equal(component.groupEditing, null);
 console.log('Provider group edits handle conflicts, duplicate submissions and stale sessions.');
+
+async function timeoutReleasesGroupDrawer(): Promise<void> {
+  (component as any).managementTimeoutMs = 10;
+  component.editProviderGroup(provider); component.saveProviderGroup();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(component.groupSaving, false);
+  assert(component.groupError.includes('결과를 확인하지 못했습니다'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  console.log('Timed-out group changes release the drawer and report an uncertain outcome.');
+}
+timeoutReleasesGroupDrawer().catch(error => { console.error(error); process.exitCode = 1; });

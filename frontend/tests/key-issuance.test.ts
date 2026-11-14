@@ -63,3 +63,17 @@ component.issueKey();
 assert.notEqual(ids[4], ids[5]);
 result.complete();
 console.log('Key issuance prevents duplicate submissions and keeps prior key visible on uncertain failure.');
+
+async function timeoutKeepsIdempotencyKey(): Promise<void> {
+  (component as any).managementTimeoutMs = 10;
+  result = new Subject<unknown>(); component.keyName = 'timeout'; component.issueKey();
+  const requestId = ids.at(-1);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert(!component.issuingKey);
+  assert(component.keyIssueUncertain);
+  result = new Subject<unknown>(); component.issueKey();
+  assert.equal(ids.at(-1), requestId);
+  result.complete();
+  console.log('Timed-out issuance releases the drawer and retains the idempotency key.');
+}
+timeoutKeepsIdempotencyKey().catch(error => { console.error(error); process.exitCode = 1; });
