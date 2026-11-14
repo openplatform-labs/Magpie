@@ -24,7 +24,7 @@ from starlette.requests import Request
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
-from app.main import AdjustmentIn, CapabilityVerificationIn, ModelIn, RouteIn, SecretIn, adjust_budget, app, change_provider_key, create_model, create_route, db_session, rotate_provider_key, set_capability_verification, update_model
+from app.main import AdjustmentIn, CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, adjust_budget, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
 from app.models import AdminSession, AdminUser, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, RouteTarget, UsageRecord
 from app.rate_limit import consume
 from app.database import runtime_engine
@@ -112,6 +112,96 @@ try:
         assert client.get('/admin/providers', headers=bootstrap).status_code == 401
         response = client.post('/admin/sessions', json=user); assert response.status_code == 201
         auth = {'Authorization': 'Bearer ' + response.json()['token']}
+        # Hold the catalog lock in each possible winner, then start the other
+        # operation. Verify both serialization orders without provider access.
+        for group_first in (True, False):
+            suffix = 'group-first' if group_first else 'model-first'
+            group_provider = client.post('/admin/providers', headers=auth, json={
+                'name':'purpose-race-' + suffix, 'provider_type':'openai', 'model_group':'general'}).json()['id']
+            entered, release, second_started = threading.Event(), threading.Event(), threading.Event()
+            model_body = ModelIn(alias='purpose-' + suffix, provider_id=group_provider, upstream_model='mock', operations=['generation'])
+            def operation(group, hold=False):
+                with Session(test_engine) as session:
+                    try:
+                        if hold:
+                            lock_catalog(session)
+                            entered.set()
+                            assert release.wait(10)
+                        else:
+                            second_started.set()
+                        if group:
+                            set_provider_model_group(group_provider, ProviderGroupIn(model_group='embedding'), session, 'admin:1')
+                            return 200
+                        create_model(model_body, session, 'admin:1')
+                        return 201
+                    except HTTPException as error:
+                        session.rollback()
+                        return error.status_code
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(operation, group_first, True)
+                assert entered.wait(10)
+                second = pool.submit(operation, not group_first)
+                assert second_started.wait(10)
+                try:
+                    try:
+                        second.result(timeout=0.2)
+                        raise AssertionError('Catalog lock did not block the competing operation')
+                    except FutureTimeout:
+                        pass
+                finally:
+                    release.set()
+                results = (first.result(timeout=10), second.result(timeout=10))
+            assert results == ((200, 422) if group_first else (201, 409)), results
+            providers_after = client.get('/admin/providers', headers=auth).json()
+            group_after = next(p['model_group'] for p in providers_after if p['id'] == group_provider)
+            models_after = [m for m in client.get('/admin/models', headers=auth).json() if m['provider_id'] == group_provider]
+            assert (group_after, len(models_after)) == (('embedding', 0) if group_first else ('general', 1))
+        # Reassignment of an existing model must obey the same lock ordering.
+        for group_first in (True, False):
+            suffix = 'move-group-first' if group_first else 'move-model-first'
+            source = client.post('/admin/providers', headers=auth, json={
+                'name':'source-' + suffix, 'provider_type':'openai', 'model_group':'general'}).json()['id']
+            target = client.post('/admin/providers', headers=auth, json={
+                'name':'target-' + suffix, 'provider_type':'openai', 'model_group':'general'}).json()['id']
+            created = client.post('/admin/models', headers=auth, json={
+                'alias':'purpose-' + suffix, 'provider_id':source, 'upstream_model':'mock', 'operations':['generation']}).json()['id']
+            body = ModelIn(alias='purpose-' + suffix, provider_id=target, upstream_model='mock', operations=['generation'])
+            entered, release, second_started = threading.Event(), threading.Event(), threading.Event()
+            def change_or_move(group, hold=False):
+                with Session(test_engine) as session:
+                    try:
+                        if hold:
+                            lock_catalog(session)
+                            entered.set()
+                            assert release.wait(10)
+                        else:
+                            second_started.set()
+                        if group:
+                            set_provider_model_group(target, ProviderGroupIn(model_group='embedding'), session, 'admin:1')
+                        else:
+                            update_model(created, body, session, 'admin:1')
+                        return 200
+                    except HTTPException as error:
+                        session.rollback()
+                        return error.status_code
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(change_or_move, group_first, True)
+                assert entered.wait(10)
+                second = pool.submit(change_or_move, not group_first)
+                assert second_started.wait(10)
+                try:
+                    try:
+                        second.result(timeout=0.2)
+                        raise AssertionError('Catalog lock did not block model reassignment')
+                    except FutureTimeout:
+                        pass
+                finally:
+                    release.set()
+                results = (first.result(timeout=10), second.result(timeout=10))
+            assert results == ((200, 422) if group_first else (200, 409)), results
+            group_after = next(p['model_group'] for p in client.get('/admin/providers', headers=auth).json() if p['id'] == target)
+            model_after = next(m for m in client.get('/admin/models', headers=auth).json() if m['id'] == created)
+            assert (group_after, model_after['provider_id']) == (('embedding', source) if group_first else ('general', target))
         deferred = client.post('/admin/providers', headers=auth, json={'name':'deferred','provider_type':'exaone'})
         assert deferred.status_code == 201 and deferred.json()['configured'] is False
         deferred_id = deferred.json()['id']
@@ -126,7 +216,7 @@ try:
         try:
             os.environ['MAGPIE_ENCRYPTION_KEY'] = Fernet.generate_key().decode()
             health = client.get('/admin/provider-credential-health', headers=auth).json()
-            assert health['unreadable_count'] == 1 and health['providers'][0]['status'] == 'unreadable'
+            assert health['unreadable_count'] == 1 and next(p['status'] for p in health['providers'] if p['provider_id'] == deferred_id) == 'unreadable'
             assert 'fake-later' not in str(health)
         finally:
             os.environ['MAGPIE_ENCRYPTION_KEY'] = saved_encryption
