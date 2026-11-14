@@ -60,3 +60,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 
 .drawer.panel fieldset.drawer-fields { margin: 0; padding: 0; border: 0; }
 .drawer.panel fieldset.drawer-fields label { display: block; margin-right: 0; }
+
+.time-input { position: relative; display: flex; align-items: end; gap: 8px; max-width: 460px; }
+.panel .time-input > input[type=text], .admin-panel .time-input > input[type=text] { min-width: 0; flex: 1; }
+.time-input .time-picker-button { flex: none; margin: 0; white-space: nowrap; }
+.time-picker-popover { position: absolute; top: calc(100% + 6px); left: 0; z-index: 10; display: block; width: min(300px, 90vw); box-sizing: border-box; padding: 16px; border: 1px solid #cbd8dd; border-radius: 7px; background: white; box-shadow: 0 8px 24px rgba(15, 37, 51, .18); }
+.time-picker-popover .picker-field { display: block; margin-bottom: 12px; font-size: 12px; }
+.panel .time-picker-popover input, .admin-panel .time-picker-popover input { width: 100%; max-width: none; margin: 6px 0 0; }
+.picker-actions { display: flex; gap: 8px; }
+.time-picker-popover .error { display: block; padding: 8px; }

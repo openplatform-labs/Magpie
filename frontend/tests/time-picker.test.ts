@@ -1,0 +1,21 @@
+import '@angular/compiler';
+import { strict as assert } from 'node:assert';
+import { ChangeDetectorRef, Injector, runInInjectionContext } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { AppComponent } from '../src/app/app.component';
+import { SessionLifecycle } from '../src/app/session-lifecycle';
+
+const injector = Injector.create({providers: [SessionLifecycle, {provide:HttpClient,useValue:{}}, {provide:ChangeDetectorRef,useValue:{markForCheck(){}}}]});
+const component = runInInjectionContext(injector, () => new AppComponent());
+let validity = 'old error';
+const textInput = {setCustomValidity: (value:string) => validity = value};
+const event = {currentTarget:{closest:() => ({querySelector:() => textInput})}} as unknown as Event;
+component.usageStart = '2026-11-14:1805'; component.toggleTimePicker('usageStart');
+assert.equal(component.pickerDate, '2026-11-14'); assert.equal(component.pickerTime, '18:05');
+component.pickerDate = '2026-02-29'; component.pickerTime = '12:00'; component.applyTimePicker('usageStart', event);
+assert(component.pickerError); assert.equal(component.usageStart, '2026-11-14:1805');
+component.pickerDate = '2026-11-15'; component.pickerTime = '09:07'; component.applyTimePicker('usageStart', event);
+assert.equal(component.usageStart, '2026-11-15:0907'); assert.equal(validity, ''); assert.equal(component.pickerField, null);
+component.toggleTimePicker('editExpiry'); assert(component.pickerDate); assert(component.pickerTime);
+component.toggleTimePicker('editExpiry'); assert.equal(component.pickerField, null);
+console.log('Date and time picker validates and applies the selected local timestamp.');

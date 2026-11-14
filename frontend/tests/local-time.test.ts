@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { formatLocalTime, parseLocalTime } from '../src/app/local-time';
+import { formatLocalTime, parseLocalTime, toPickerTime, fromPickerTime } from '../src/app/local-time';
 
 for (const text of ['2026-11-14:1805', '2024-02-29:0000', '0001-01-01:0000']) {
   const date = parseLocalTime(text); assert(date); assert.equal(formatLocalTime(date), text);
@@ -10,3 +10,8 @@ if (process.env.TZ === 'America/New_York') {
   assert.equal(parseLocalTime('2026-03-08:0230'), null);
   assert(parseLocalTime('2026-03-08:0330'));
 }
+
+assert.equal(toPickerTime('2026-11-14:1805'), '2026-11-14T18:05');
+assert.equal(fromPickerTime('2026-11-14T18:05'), '2026-11-14:1805');
+assert.equal(toPickerTime('2026-02-29:1805'), '');
+assert.equal(fromPickerTime('invalid'), '');
