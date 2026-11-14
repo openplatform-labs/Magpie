@@ -81,14 +81,8 @@ def end(bind, request_id, started, status, usage=None):
         logger.warning('Could not finalize usage record %s', request_id)
 
 
-async def finish(bind, request_id, started, status, usage=None, circuit=None, circuit_failed=None):
-    def write():
-        end(bind, request_id, started, status, usage)
-        if circuit is not None and circuit_failed is not None:
-            from . import circuits
-            circuits.record(bind, *circuit, circuit_failed)
-
-    task = asyncio.create_task(asyncio.to_thread(write))
+async def finish(bind, request_id, started, status, usage=None):
+    task = asyncio.create_task(asyncio.to_thread(end, bind, request_id, started, status, usage))
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -97,7 +91,7 @@ async def finish(bind, request_id, started, status, usage=None, circuit=None, ci
         raise
 
 
-async def tracked_stream(stream, alias, bind, request_id, started, circuit, usage_provider=None):
+async def tracked_stream(stream, alias, bind, request_id, started, usage_provider=None):
     status, usage = 'interrupted', None
     seen_choices, finished_choices = set(), set()
     try:
@@ -176,8 +170,7 @@ async def tracked_stream(stream, alias, bind, request_id, started, circuit, usag
         # raise while closing, and must not leave an already finished request
         # indefinitely marked as started.
         try:
-            await finish(bind, request_id, started, status, usage, circuit,
-                         status == 'error' if status in ('success', 'error') else None)
+            await finish(bind, request_id, started, status, usage)
         finally:
             try:
                 close = getattr(stream, 'aclose', None)

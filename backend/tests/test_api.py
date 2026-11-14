@@ -187,6 +187,32 @@ def test_legacy_budget_keys_fail_closed_and_keep_financial_history(context, monk
         assert session.get(UsageRecord, 'legacy-request') is not None
     assert client.get('/admin/budgets', headers=admin()).status_code == 404
 
+def test_legacy_routes_remain_stored_but_do_not_route_or_retry(context, monkeypatch):
+    from app.models import ModelRoute, RouteTarget
+    client, db = context
+    _, model, key = configure(client, ['embedding'])
+    with Session(db) as session:
+        route = ModelRoute(alias='legacy-route', operation='embedding', active=True, retry_on_failure=True)
+        session.add(route); session.flush()
+        session.add(RouteTarget(route_id=route.id, model_id=model, priority=0, weight=1))
+        session.commit(); route_id = route.id
+    calls = []
+    async def fake(config, data):
+        calls.append(True)
+        raise TimeoutError('mock timeout')
+    monkeypatch.setattr(providers, 'embedding', fake)
+    headers = {'Authorization':'Bearer '+key['key']}
+    listed = client.get('/v1/models', headers=headers).json()['data']
+    assert [item['id'] for item in listed] == ['exaone-chat']
+    assert client.post('/v1/embeddings', headers=headers, json={'model':'legacy-route','input':'x'}).status_code == 403
+    assert calls == []
+    assert client.post('/v1/embeddings', headers=headers, json={'model':'exaone-chat','input':'x'}).status_code == 504
+    assert calls == [True]
+    assert client.get('/admin/routes', headers=admin()).status_code == 404
+    with Session(db) as session:
+        assert session.get(ModelRoute, route_id) is not None
+        assert session.query(RouteTarget).filter_by(route_id=route_id).count() == 1
+
 def test_provider_credential_health_is_read_only_and_never_returns_secrets(context):
     client, db = context
     valid = client.post('/admin/providers', headers=admin(), json={'name':'valid','provider_type':'exaone','api_key':'private-provider-secret'}).json()['id']
@@ -269,9 +295,8 @@ def test_auth_secret_encryption_and_revocation(context):
 def test_model_discovery_excludes_missing_provider_credentials(context, monkeypatch, missing_secret):
     client, db = context
     provider, model, key = configure(client, ['generation'])
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'chat-route','operation':'generation','targets':[{'model_id':model}]}).status_code == 201
     auth = {'Authorization':'Bearer '+key['key']}
-    assert {row['id'] for row in client.get('/v1/models', headers=auth).json()['data']} == {'exaone-chat','chat-route'}
+    assert {row['id'] for row in client.get('/v1/models', headers=auth).json()['data']} == {'exaone-chat'}
 
     with Session(db) as session:
         session.get(ProviderConnection, provider).encrypted_api_key = missing_secret
@@ -284,10 +309,9 @@ def test_model_discovery_excludes_missing_provider_credentials(context, monkeypa
     assert client.get('/v1/models', headers=auth).json()['data'] == []
     payload = {'messages':[{'role':'user','content':'test'}]}
     assert client.post('/v1/chat/completions', headers=auth, json={'model':'exaone-chat',**payload}).status_code == 503
-    assert client.post('/v1/chat/completions', headers=auth, json={'model':'chat-route',**payload}).status_code == 403
     assert not calls
     assert client.put(f'/admin/providers/{provider}/key', headers=admin(), json={'api_key':'new-mock-secret'}).status_code == 200
-    assert {row['id'] for row in client.get('/v1/models', headers=auth).json()['data']} == {'exaone-chat','chat-route'}
+    assert {row['id'] for row in client.get('/v1/models', headers=auth).json()['data']} == {'exaone-chat'}
 
 @pytest.mark.parametrize(('provider_type', 'operation', 'path', 'payload'), [
     ('exaone', 'embedding', '/v1/embeddings', {'model':'deferred','input':'test'}),
@@ -1068,10 +1092,9 @@ def test_stalled_stream_times_out_and_preserves_reservation(context, monkeypatch
 def test_client_stream_close_marks_interrupted_and_closes_provider(monkeypatch):
     import asyncio
     import time
-    from app import observability, circuits
+    from app import observability
     recorded, closed = [], []
     monkeypatch.setattr(observability, 'end', lambda bind, request_id, started, status, usage: recorded.append(status))
-    monkeypatch.setattr(circuits, 'record', lambda *args: recorded.append('circuit'))
     async def source():
         try:
             yield {'choices':[{'index':0,'delta':{'content':'partial'},'finish_reason':None}]}
@@ -1079,7 +1102,7 @@ def test_client_stream_close_marks_interrupted_and_closes_provider(monkeypatch):
         finally:
             closed.append(True)
     async def run():
-        stream = observability.tracked_stream(source(), 'alias', None, 'id', time.monotonic(), (1,'generation',1))
+        stream = observability.tracked_stream(source(), 'alias', None, 'id', time.monotonic())
         assert 'partial' in await anext(stream)
         await stream.aclose()
     asyncio.run(run())
@@ -1090,7 +1113,7 @@ def test_stream_cleanup_runs_if_finalization_is_cancelled(monkeypatch):
     import asyncio
     import threading
     import time
-    from app import observability, circuits
+    from app import observability
     entered, release = threading.Event(), threading.Event()
     events = []
     def delayed_end(bind, request_id, started, status, usage):
@@ -1098,7 +1121,6 @@ def test_stream_cleanup_runs_if_finalization_is_cancelled(monkeypatch):
         assert release.wait(5)
         events.append(status)
     monkeypatch.setattr(observability, 'end', delayed_end)
-    monkeypatch.setattr(circuits, 'record', lambda *args: None)
     class Source:
         sent = False
         def __aiter__(self): return self
@@ -1108,7 +1130,7 @@ def test_stream_cleanup_runs_if_finalization_is_cancelled(monkeypatch):
             return {'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]}
         async def aclose(self): events.append('closed')
     async def run():
-        stream = observability.tracked_stream(Source(), 'alias', None, 'id', time.monotonic(), (1,'generation',1))
+        stream = observability.tracked_stream(Source(), 'alias', None, 'id', time.monotonic())
         await anext(stream)
         assert '[DONE]' in await anext(stream)
         task = asyncio.create_task(anext(stream))
@@ -1128,11 +1150,10 @@ def test_stream_cleanup_runs_if_finalization_is_cancelled(monkeypatch):
 def test_stream_cleanup_failure_cannot_prevent_finalization(monkeypatch, caplog, cleanup):
     import asyncio
     import time
-    from app import observability, circuits
+    from app import observability
     events = []
     monkeypatch.setattr(observability, 'STREAM_CLOSE_TIMEOUT_SECONDS', 0.03)
     monkeypatch.setattr(observability, 'end', lambda bind, request_id, started, status, usage: events.append(('end', status)))
-    monkeypatch.setattr(circuits, 'record', lambda *args: events.append(('circuit', args[-1])))
 
     class Source:
         def __init__(self): self.sent = False
@@ -1147,11 +1168,11 @@ def test_stream_cleanup_failure_cannot_prevent_finalization(monkeypatch, caplog,
             await asyncio.Event().wait()
 
     async def run():
-        return [part async for part in observability.tracked_stream(Source(), 'alias', None, 'id', time.monotonic(), (1,'generation',1))]
+        return [part async for part in observability.tracked_stream(Source(), 'alias', None, 'id', time.monotonic())]
 
     output = asyncio.run(run())
     assert output[-1] == 'data: [DONE]\n\n'
-    assert events == [('end', 'success'), ('circuit', False), ('close', None)]
+    assert events == [('end', 'success'), ('close', None)]
     assert 'secret provider detail' not in caplog.text
 
 
@@ -1739,34 +1760,6 @@ def test_openai_decision_adapter_roundtrip_without_network(context, monkeypatch)
     assert blocked.status_code == 400 and len(captured) == 1
 
 
-def test_decision_route_selects_eligible_provider_before_dispatch(context, monkeypatch):
-    import base64
-    client, _ = context
-    tp, jev, _ = configure_jev(client)
-    op = client.post('/admin/providers', headers=admin(), json={'name':'openai','provider_type':'openai','api_key':'fake'}).json()['id']
-    other = client.post('/admin/models', headers=admin(), json={'alias':'openai-judge','provider_id':op,'upstream_model':'gpt-6-luna','operations':['decision']}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'judges','operation':'decision','targets':[{'model_id':jev['id'],'priority':0},{'model_id':other,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'both','model_ids':[jev['id'],other]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append(config)
-        if data['questions'][0]['type'] == 'box':
-            return {'answers':[{'type':'box','name':'box','box':{'left':0.1,'right':0.9,'top':0.1,'bottom':0.9},'confidence':0.8}]}
-        return {'answers':[{'type':'predicate','name':'q','probability':0.9}]}
-    monkeypatch.setattr(providers, 'decision', fake)
-    png = base64.b64encode(b'\x89PNG\r\n\x1a\nmock').decode()
-    body = {'model':'judges','input':[{'type':'message','role':'user','content':[{'type':'input_image','image_url':'data:image/png;base64,'+png}]}], 'questions':[{'type':'predicate','name':'q','instructions':'yes?'}]}
-    auth = {'Authorization':'Bearer '+key}
-    assert client.post('/v1/decisions', headers=auth, json=body).status_code == 200
-    assert calls[-1]['model'] == 'openai/gpt-6-luna' and 'extra_headers' not in calls[-1]
-    assert client.post('/v1/decisions', headers={**auth,'TypeSafe-Danger-Zone-Images':'true'}, json=body).status_code == 200
-    assert calls[-1]['model'] == 'typesafe/jev-latest' and calls[-1]['extra_headers']['TypeSafe-Danger-Zone-Images'] == 'true'
-    box_body = {**body, 'questions':[{'type':'box','name':'box','instructions':'locate'}]}
-    assert client.post('/v1/decisions', headers=auth, json=box_body).status_code == 400
-    assert client.post('/v1/decisions', headers={**auth,'TypeSafe-Danger-Zone-Images':'true'}, json=box_body).status_code == 200
-    assert calls[-1]['model'] == 'typesafe/jev-latest' and len(calls) == 3
-    anthropic = client.post('/admin/providers', headers=admin(), json={'name':'anthropic','provider_type':'anthropic','api_key':'fake'}).json()['id']
-    assert client.post('/admin/models', headers=admin(), json={'alias':'not-supported','provider_id':anthropic,'upstream_model':'mock','operations':['decision']}).status_code == 422
 
 
 def test_openai_compatible_error_and_timeout(context, monkeypatch):
@@ -1886,7 +1879,6 @@ def test_encryption_rotation_preserves_pending_sso_and_rejects_mixed_keys(contex
 
 
 def test_provider_key_rotation_invalidates_model_evidence_atomically(context, monkeypatch):
-    from app import circuits
     client, db = context
     provider_id, first, key = configure(client)
     second = client.post('/admin/models', headers=admin(), json={'alias':'second','provider_id':provider_id,'upstream_model':'second','operations':['embedding']}).json()['id']
@@ -1896,9 +1888,6 @@ def test_provider_key_rotation_invalidates_model_evidence_atomically(context, mo
     for model_id, operation in [(first,'generation'),(first,'embedding'),(second,'embedding'),(other,'generation')]:
         result = client.put(f'/admin/models/{model_id}/capabilities/{operation}/verification', headers=admin(), json={'status':'mock_verified','note':'fixture','expected_version':initial[model_id]['verification_version']})
         assert result.status_code == 200
-    for _ in range(circuits.FAILURE_THRESHOLD):
-        circuits.record(db, first, 'generation', initial[first]['verification_version'], True)
-    assert client.get('/admin/model-circuits', headers=admin()).json()[0]['cooling_down']
     assert client.put(f'/admin/providers/{provider_id}/key', headers=admin(), json={'api_key':'new-provider-secret'}).status_code == 200
     models = {m['id']:m for m in client.get('/admin/models', headers=admin()).json()}
     for model_id in (first,second):
@@ -1906,7 +1895,6 @@ def test_provider_key_rotation_invalidates_model_evidence_atomically(context, mo
         assert all(c['verification_status'] == 'unverified' for c in models[model_id]['capabilities'])
     assert models[other]['verification_version'] == initial[other]['verification_version']
     assert models[other]['capabilities'][0]['verification_status'] == 'mock_verified'
-    assert client.get('/admin/model-circuits', headers=admin()).json() == []
     assert client.put(f'/admin/models/{first}/capabilities/generation/verification', headers=admin(), json={'status':'mock_verified','note':'stale','expected_version':initial[first]['verification_version']}).status_code == 409
     history = client.get(f'/admin/models/{first}/verification-history', headers=admin()).json()
     assert sum(event['note'] == 'Provider credential changed' and event['status'] == 'unverified' for event in history) == 2
@@ -2130,259 +2118,24 @@ def test_retention_preserves_pending_and_budget_history(context, monkeypatch):
     assert any(x['action'] == 'retention.apply' for x in client.get('/admin/audit', headers=admin()).json())
 
 
-def test_route_respects_grants_priority_and_no_retry(context, monkeypatch):
-    client, _ = context
-    provider_id, first, restricted = configure(client, ['embedding'])
-    client.put('/admin/models/'+str(first), headers=admin(), json={'alias':'exaone-chat','provider_id':provider_id,'upstream_model':'k-exaone_v2.5','operations':['embedding'],'embedding_space':'space-a','embedding_dimensions':768})
-    second = client.post('/admin/models', headers=admin(), json={'alias':'backup','upstream_model':'embed-v2','provider_id':provider_id,'operations':['embedding'],'embedding_space':'space-a','embedding_dimensions':768}).json()['id']
-    body = {'alias':'shared-embed','operation':'embedding','targets':[{'model_id':first,'priority':0,'weight':1},{'model_id':second,'priority':1,'weight':1}]}
-    route = client.post('/admin/routes', headers=admin(), json=body)
-    assert route.status_code == 201
-    both = client.post('/admin/api-keys', headers=admin(), json={'name':'both','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append(config['model'])
-        return {'model':config['model'],'data':mock_vectors(data['input'], 768),'usage':{'prompt_tokens':1}}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    auth = {'Authorization':'Bearer '+both}
-    assert 'shared-embed' in [x['id'] for x in client.get('/v1/models', headers=auth).json()['data']]
-    response = client.post('/v1/embeddings', headers=auth, json={'model':'shared-embed','input':'x'})
-    assert response.status_code == 200 and response.json()['model'] == 'shared-embed'
-    assert calls == ['openai/k-exaone_v2.5']
-    row = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    assert row['model_id'] == first and row['requested_alias'] == 'shared-embed'
-    assert client.put('/admin/models/'+str(first)+'/active', headers=admin(), json={'active':False}).status_code == 200
-    assert client.post('/v1/embeddings', headers=auth, json={'model':'shared-embed','input':'x'}).status_code == 200
-    assert calls[-1] == 'openai/embed-v2'
-    assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+restricted['key']}, json={'model':'shared-embed','input':'x'}).status_code == 403
-    async def fail(config, data):
-        calls.append(config['model']); raise RuntimeError('failed')
-    monkeypatch.setattr(providers, 'embedding', fail)
-    before = len(calls)
-    assert client.post('/v1/embeddings', headers=auth, json={'model':'shared-embed','input':'x'}).status_code == 502
-    assert len(calls) == before + 1
-    assert client.post('/admin/models', headers=admin(), json={'alias':'shared-embed','provider_id':provider_id,'upstream_model':'x','operations':['embedding']}).status_code == 409
-    assert client.post('/admin/routes', headers=admin(), json={**body,'alias':'backup'}).status_code == 409
 
 
-def test_route_cooldown_skips_failed_target_without_replaying_request(context, monkeypatch):
-    from app import circuits
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    metadata = {'operations':['embedding'],'provider_id':provider_id,'embedding_space':'shared','embedding_dimensions':768}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**metadata,'alias':'exaone-chat','upstream_model':'first'}).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'second','upstream_model':'second'}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'fail-route','operation':'embedding','targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'fail-key','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append(config['model'])
-        if config['model'].endswith('/first'): raise RuntimeError('mock failure')
-        return {'data':mock_vectors(data['input'], 768)}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    auth = {'Authorization':'Bearer '+key}
-    payload = {'model':'fail-route','input':'sample'}
-    for _ in range(circuits.FAILURE_THRESHOLD):
-        assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 502
-    assert calls == ['openai/first'] * circuits.FAILURE_THRESHOLD
-    state = client.get('/admin/model-circuits', headers=admin()).json()
-    assert state[0]['model_id'] == first and state[0]['cooling_down']
-    assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 200
-    assert calls[-1] == 'openai/second'
-    assert client.delete(f'/admin/models/{first}/capabilities/embedding/circuit', headers=admin()).status_code == 204
-    assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 502
-    assert calls[-1] == 'openai/first'
-    assert any(a['action'] == 'model.circuit.reset' for a in client.get('/admin/audit', headers=admin()).json())
 
 
-def test_opt_in_route_retry_tracks_each_attempt_and_budget(context, monkeypatch):
-    from decimal import Decimal
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    metadata = {'operations':['embedding'],'provider_id':provider_id,'embedding_space':'shared','embedding_dimensions':768}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**metadata,'alias':'exaone-chat','upstream_model':'first'}).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'second','upstream_model':'second'}).json()['id']
-    for model_id in [first, second]:
-        assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    route = client.post('/admin/routes', headers=admin(), json={'alias':'retry-route','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]})
-    assert route.status_code == 201 and route.json()['retry_on_failure'] is True
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'retry-key','model_ids':[first,second]}).json()
-    calls = []
-    async def fake(config, data):
-        calls.append(config['model'])
-        if config['model'].endswith('/first'): raise TimeoutError()
-        return {'model':'second','data':mock_vectors(data['input'], 768),'usage':{'prompt_tokens':1}}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+key['key']}, json={'model':'retry-route','input':'sample'})
-    assert response.status_code == 200 and calls == ['openai/first','openai/second']
-    assert response.headers['x-request-id'] != response.headers['x-attempt-id']
-    records = client.get('/admin/usage/requests', headers=admin()).json()
-    records = sorted([r for r in records if r['root_request_id'] == response.headers['x-request-id']], key=lambda r:r['attempt_number'])
-    assert [(r['model_id'], r['status'], r['attempt_number']) for r in records] == [(first, 'error', 1), (second, 'success', 2)]
-    filtered = client.get('/admin/usage/requests', headers=admin(), params={'root_request_id':response.headers['x-request-id']}).json()
-    assert len(filtered) == 2 and all(r['root_request_id'] == response.headers['x-request-id'] for r in filtered)
-    assert client.get('/admin/usage/requests', headers=admin(), params={'root_request_id':'invalid'}).status_code == 422
-    metrics = client.get('/admin/metrics', headers=admin(), params={'key_id':key['id']}).json()
-    assert metrics['unique_requests'] == 1 and metrics['attempts'] == metrics['requests'] == 2 and metrics['retry_attempts'] == 1
-    assert metrics['success'] == 1 and metrics['errors'] == 1
-    metrics = client.get('/admin/metrics', headers=admin(), params={'key_id':key['id'], 'status':'error'}).json()
-    assert metrics['unique_requests'] == metrics['attempts'] == 1 and metrics['retry_attempts'] == 0
 
 
-def test_retry_does_not_bypass_budget_or_retry_bad_request(context, monkeypatch):
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    metadata = {'operations':['embedding'],'provider_id':provider_id,'embedding_space':'same','embedding_dimensions':16}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**metadata,'alias':'exaone-chat','upstream_model':'first'}).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'backup','upstream_model':'second'}).json()['id']
-    for model_id in (first, second):
-        assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'0','output_per_million':'0'}).status_code == 201
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'retry','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'budget','model_ids':[first,second]}).json()
-    calls = []
-    async def fail(config, data): calls.append(config['model']); raise TimeoutError()
-    monkeypatch.setattr(providers, 'embedding', fail)
-    auth = {'Authorization':'Bearer '+key['key']}
-    response = client.post('/v1/embeddings', headers=auth, json={'model':'retry','input':'x'})
-    assert response.status_code == 504 and len(calls) == 2 and response.headers['x-request-id']
-    assert len(client.get('/admin/usage/requests', headers=admin()).json()) == 2
-    class Invalid(Exception): status_code = 400
-    async def invalid(config, data): calls.append(config['model']); raise Invalid()
-    monkeypatch.setattr(providers, 'embedding', invalid)
-    another = client.post('/admin/api-keys', headers=admin(), json={'name':'unlimited','model_ids':[first,second]}).json()
-    response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+another['key']}, json={'model':'retry','input':'x'})
-    assert response.status_code == 400 and len(calls) == 3
 
 
-def test_retry_respects_revocation_and_streaming_boundary(context, monkeypatch):
-    client, db = context
-    provider_id, first, _ = configure(client, ['generation'])
-    second = client.post('/admin/models', headers=admin(), json={'alias':'backup','provider_id':provider_id,'upstream_model':'backup','operations':['generation']}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'chat-retry','operation':'generation','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'revoked','model_ids':[first,second]}).json()
-    calls = []
-    async def revoke_then_fail(config, data):
-        calls.append(config['model'])
-        with Session(db) as session:
-            session.get(ClientKey, key['id']).active = False
-            session.commit()
-        raise TimeoutError()
-    monkeypatch.setattr(providers, 'completion', revoke_then_fail)
-    payload = {'model':'chat-retry','messages':[{'role':'user','content':'hello'}]}
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json=payload)
-    assert response.status_code == 504 and len(calls) == 1
-    another = client.post('/admin/api-keys', headers=admin(), json={'name':'stream','model_ids':[first,second]}).json()
-    async def fail(config, data): calls.append(config['model']); raise TimeoutError()
-    monkeypatch.setattr(providers, 'completion', fail)
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+another['key']}, json={**payload,'stream':True})
-    assert response.status_code == 504 and len(calls) == 2
 
 
-def test_retry_does_not_switch_to_replacement_route(context, monkeypatch):
-    from app.models import ModelRoute, RouteTarget
-    client, db = context
-    provider_id, first, _ = configure(client, ['generation'])
-    second = client.post('/admin/models', headers=admin(), json={'alias':'backup','provider_id':provider_id,'upstream_model':'backup','operations':['generation']}).json()['id']
-    route = client.post('/admin/routes', headers=admin(), json={'alias':'retry-route','operation':'generation','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).json()
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'route-key','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def rename_replace_and_fail(config, data):
-        calls.append(config['model'])
-        with Session(db) as session:
-            session.get(ModelRoute, route['id']).alias = 'renamed-route'
-            session.flush()
-            session.add(ModelRoute(alias='retry-route', operation='generation', active=True, retry_on_failure=True,
-                targets=[RouteTarget(model_id=second, priority=0, weight=1)]))
-            session.commit()
-        raise TimeoutError()
-    monkeypatch.setattr(providers, 'completion', rename_replace_and_fail)
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key}, json={'model':'retry-route','messages':[{'role':'user','content':'hello'}]})
-    assert response.status_code == 504 and calls == ['openai/k-exaone_v2.5']
-    records = client.get('/admin/usage/requests', headers=admin(), params={'root_request_id':response.headers['x-request-id']}).json()
-    assert len(records) == 1 and records[0]['status'] == 'error'
 
 
-def test_circuit_ignores_bad_requests_recovers_and_is_versioned(context, monkeypatch):
-    from datetime import datetime, timedelta, timezone
-    from app.models import ModelCircuit
-    client, db = context
-    provider_id, model_id, key = configure(client, ['embedding'])
-    auth = {'Authorization':'Bearer '+key['key']}
-    payload = {'model':'exaone-chat','input':'sample'}
-    class UpstreamError(Exception):
-        status_code = 400
-    async def bad(config, data): raise UpstreamError()
-    monkeypatch.setattr(providers, 'embedding', bad)
-    for _ in range(4): assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 400
-    assert client.get('/admin/model-circuits', headers=admin()).json() == []
-    async def fail(config, data): raise TimeoutError()
-    monkeypatch.setattr(providers, 'embedding', fail)
-    for _ in range(3): assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 504
-    assert client.get('/admin/model-circuits', headers=admin()).json()[0]['cooling_down']
-    with Session(db) as session:
-        state = session.query(ModelCircuit).one()
-        state.open_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-        session.commit()
-    async def success(config, data): return {'data':mock_vectors(data['input'])}
-    monkeypatch.setattr(providers, 'embedding', success)
-    assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 200
-    state = client.get('/admin/model-circuits', headers=admin()).json()[0]
-    assert state['failure_count'] == 0 and state['open_until'] is None
-    monkeypatch.setattr(providers, 'embedding', fail)
-    for _ in range(3): assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 504
-    assert client.put('/admin/models/'+str(model_id), headers=admin(), json={'alias':'exaone-chat','provider_id':provider_id,'upstream_model':'new-model','operations':['embedding']}).status_code == 200
-    assert client.get('/admin/model-circuits', headers=admin()).json() == []
 
 
-def test_weighted_route_selection(context, monkeypatch):
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    client.put('/admin/models/'+str(first), headers=admin(), json={'alias':'exaone-chat','provider_id':provider_id,'upstream_model':'k-exaone_v2.5','operations':['embedding'],'embedding_space':'space-a','embedding_dimensions':768})
-    second = client.post('/admin/models', headers=admin(), json={'alias':'other','upstream_model':'other','provider_id':provider_id,'operations':['embedding'],'embedding_space':'space-a','embedding_dimensions':768}).json()['id']
-    response = client.post('/admin/routes', headers=admin(), json={'alias':'weighted','operation':'embedding','targets':[{'model_id':first,'weight':1},{'model_id':second,'weight':3}]})
-    assert response.status_code == 201
-    token = client.post('/admin/api-keys', headers=admin(), json={'name':'weighted-key','model_ids':[first,second]}).json()['key']
-    chosen = []
-    async def fake(config, data): chosen.append(config['model']); return {'model':'x','data':mock_vectors(data['input'], 768)}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    monkeypatch.setattr('app.main.secrets.randbelow', lambda total: total-1)
-    assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+token}, json={'model':'weighted','input':'x'}).status_code == 200
-    assert chosen == ['openai/other']
 
 
-def test_embedding_route_skips_gemini_for_media_reference(context, monkeypatch):
-    client, _ = context
-    gemini = client.post('/admin/providers', headers=admin(), json={'name':'gemini','provider_type':'gemini','api_key':'fake'}).json()['id']
-    other = client.post('/admin/providers', headers=admin(), json={'name':'other','provider_type':'exaone','api_key':'fake'}).json()['id']
-    metadata = {'operations':['embedding'],'embedding_space':'shared','embedding_dimensions':2}
-    first = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'first','provider_id':gemini,'upstream_model':'gemini-embedding-001'}).json()['id']
-    second = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'second','provider_id':other,'upstream_model':'test'}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'route','operation':'embedding','targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append((config['model'],data['input'])); return {'data':mock_vectors(data['input'])}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+key}, json={'model':'route','input':'files/literal-text'})
-    assert response.status_code == 200 and calls == [('openai/test','files/literal-text')]
 
 
-def test_embedding_route_selects_target_compatible_with_batch(context, monkeypatch):
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    metadata = {'operations':['embedding'],'provider_id':provider_id,'embedding_space':'shared','embedding_dimensions':768}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**metadata,'alias':'exaone-chat','upstream_model':'first','supports_embedding_batch':False}).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={**metadata,'alias':'second','upstream_model':'second','supports_embedding_batch':True,'embedding_max_batch_size':2}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'batch-route','operation':'embedding','targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'batch-key','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def fake(config, data): calls.append(config['model']); return {'data':mock_vectors(data['input'], 768)}
-    monkeypatch.setattr(providers, 'embedding', fake)
-    auth = {'Authorization':'Bearer '+key}
-    assert client.post('/v1/embeddings', headers=auth, json={'model':'batch-route','input':['a','b']}).status_code == 200
-    assert calls == ['openai/second']
-    assert client.post('/v1/embeddings', headers=auth, json={'model':'batch-route','input':['a','b','c']}).status_code == 400
-    assert len(calls) == 1
 
 
 def test_chat_refuses_provider_managed_tools_without_calling_provider(context, monkeypatch):
@@ -2417,86 +2170,10 @@ def test_chat_refuses_provider_managed_tools_without_calling_provider(context, m
     assert client.post('/v1/chat/completions', headers=auth, json={**body,'messages':history,**safe}).status_code == 200
     assert calls[1]['messages'] == history
 
-def test_generation_route_filters_declared_unsupported_features(context, monkeypatch):
-    client, _ = context
-    provider_id, first, restricted = configure(client, ['generation'])
-    first_body = {'alias':'exaone-chat','provider_id':provider_id,'upstream_model':'first','operations':['generation'], 'supports_streaming':False,'supports_tools':False,'supports_reasoning':False}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json=first_body).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={'alias':'backup','provider_id':provider_id,'upstream_model':'backup','operations':['generation'], 'supports_streaming':True,'supports_tools':True,'supports_reasoning':True}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'feature-route','operation':'generation','targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'both','model_ids':[first,second]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append(config['model'])
-        if data.get('stream'):
-            async def chunks(): yield {'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]}
-            return chunks()
-        return {'choices':[{'index':0,'message':{'role':'assistant','content':'ok'},'finish_reason':'stop'}]}
-    monkeypatch.setattr(providers, 'completion', fake)
-    base = {'model':'feature-route','messages':[{'role':'user','content':'hi'}]}
-    auth = {'Authorization':'Bearer '+key}
-    assert client.post('/v1/chat/completions', headers=auth, json=base).status_code == 200
-    assert calls[-1] == 'openai/first'
-    for option in ({'stream':True}, {'tools':[{'type':'function','function':{'name':'lookup'}}]}, {'tool_choice':'required'}, {'reasoning_effort':'high'}):
-        assert client.post('/v1/chat/completions', headers=auth, json={**base,**option}).status_code == 200
-        assert calls[-1] == 'openai/backup'
-    histories = [
-        [{'role':'assistant','content':None,'tool_calls':[{'id':'call','type':'function','function':{'name':'lookup','arguments':'{}'}}]}],
-        [{'role':'tool','tool_call_id':'call','content':'result'}],
-        [{'role':'assistant','content':None,'function_call':{'name':'lookup','arguments':'{}'}}],
-        [{'role':'function','name':'lookup','content':'result'}],
-    ]
-    for history in histories:
-        assert client.post('/v1/chat/completions', headers=auth, json={**base,'messages':history}).status_code == 200
-        assert calls[-1] == 'openai/backup'
-        before = len(calls)
-        assert client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+restricted['key']}, json={'model':'exaone-chat','messages':history}).status_code == 400
-        assert len(calls) == before
-    before = len(calls)
-    assert client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+restricted['key']}, json={**base,'stream':True}).status_code == 400
-    assert len(calls) == before
-    # Unknown capability is not treated as an explicit denial.
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**first_body,'supports_tools':None}).status_code == 200
-    assert client.post('/v1/chat/completions', headers=auth, json={**base,'tools':[{'type':'function','function':{'name':'lookup'}}]}).status_code == 200
-    assert calls[-1] == 'openai/first'
 
 
-def test_generation_retry_skips_unsupported_target(context, monkeypatch):
-    client, _ = context
-    provider_id, first, _ = configure(client, ['generation'])
-    base_model = {'provider_id':provider_id,'operations':['generation']}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**base_model,'alias':'exaone-chat','upstream_model':'first','supports_tools':True}).status_code == 200
-    second = client.post('/admin/models', headers=admin(), json={**base_model,'alias':'no-tools','upstream_model':'second','supports_tools':False}).json()['id']
-    third = client.post('/admin/models', headers=admin(), json={**base_model,'alias':'tools-backup','upstream_model':'third','supports_tools':True}).json()['id']
-    assert client.post('/admin/routes', headers=admin(), json={'alias':'retry-features','operation':'generation','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1},{'model_id':third,'priority':2}]}).status_code == 201
-    token = client.post('/admin/api-keys', headers=admin(), json={'name':'all','model_ids':[first,second,third]}).json()['key']
-    calls = []
-    async def fake(config, data):
-        calls.append(config['model'])
-        if config['model'].endswith('/first'): raise TimeoutError()
-        return {'choices':[{'index':0,'message':{'role':'assistant','content':'ok'},'finish_reason':'stop'}]}
-    monkeypatch.setattr(providers, 'completion', fake)
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+token}, json={'model':'retry-features','messages':[{'role':'user','content':'hi'}],'tools':[{'type':'function','function':{'name':'lookup'}}]})
-    assert response.status_code == 200 and calls == ['openai/first','openai/third']
-    calls.clear()
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+token}, json={'model':'retry-features','messages':[{'role':'tool','tool_call_id':'call','content':'result'}]})
-    assert response.status_code == 200 and calls == ['openai/first','openai/third']
 
 
-def test_embedding_routes_require_explicit_same_space(context):
-    client, _ = context
-    provider_id, first, _ = configure(client, ['embedding'])
-    other_body = {'alias':'other','provider_id':provider_id,'upstream_model':'other','operations':['embedding']}
-    second = client.post('/admin/models', headers=admin(), json=other_body).json()['id']
-    route = {'alias':'emb-route','operation':'embedding','targets':[{'model_id':first},{'model_id':second}]}
-    assert client.post('/admin/routes', headers=admin(), json=route).status_code == 422
-    first_body = {'alias':'exaone-chat','provider_id':provider_id,'upstream_model':'k-exaone_v2.5','operations':['embedding'], 'embedding_space':'space-a','embedding_dimensions':768}
-    assert client.put('/admin/models/'+str(first), headers=admin(), json=first_body).status_code == 200
-    assert client.put('/admin/models/'+str(second), headers=admin(), json={**other_body,'embedding_space':'space-b','embedding_dimensions':768}).status_code == 200
-    assert client.post('/admin/routes', headers=admin(), json=route).status_code == 422
-    assert client.put('/admin/models/'+str(second), headers=admin(), json={**other_body,'embedding_space':'space-a','embedding_dimensions':768}).status_code == 200
-    assert client.post('/admin/routes', headers=admin(), json=route).status_code == 201
-    assert client.put('/admin/models/'+str(first), headers=admin(), json={**first_body,'embedding_dimensions':1536}).status_code == 409
 
 
 @pytest.mark.parametrize(('operation','raw_usage','billable'), [

@@ -21,13 +21,13 @@ from starlette.requests import Request
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
-from app.main import CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
-from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, OIDCIdentity, OIDCTransaction, RouteTarget, UsageRecord
+from app.main import CapabilityVerificationIn, ModelIn, ProviderGroupIn, SecretIn, app, change_provider_key, create_model, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
+from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelRoute, OIDCIdentity, OIDCTransaction, RouteTarget, UsageRecord
 from app.rate_limit import consume
 from app.database import runtime_engine
 from app.recover_admin import recover
 from app.rotate_key import rotate
-from app import circuits, observability, providers
+from app import observability, providers
 
 # Permit psycopg's database-host DNS lookup and libpq's connections, while
 # blocking Python HTTP clients if a provider mock is accidentally omitted.
@@ -342,11 +342,6 @@ try:
         assert record['status'] == 'error' and record['estimated_cost'] is None
         providers.completion = fake_chat
         assert client.put('/admin/models/'+str(exa_model), headers=auth, json={'alias':'chat-mock','provider_id':exa_provider,'upstream_model':'mock','operations':['generation'],'supports_tools':False}).status_code == 200
-        chat_backup = client.post('/admin/models', headers=auth, json={'alias':'chat-backup','provider_id':exa_provider,'upstream_model':'backup','operations':['generation'],'supports_tools':True}).json()['id']
-        assert client.post('/admin/routes', headers=auth, json={'alias':'feature-route','operation':'generation','targets':[{'model_id':exa_model,'priority':0},{'model_id':chat_backup,'priority':1}]}).status_code == 201
-        route_token = client.post('/admin/api-keys', headers=auth, json={'name':'feature','model_ids':[exa_model,chat_backup]}).json()['key']
-        result = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+route_token}, json={'model':'feature-route','messages':[{'role':'user','content':'hi'}],'tools':[{'type':'function','function':{'name':'lookup'}}]})
-        assert result.status_code == 200 and chat_calls[-1] == 'openai/backup'
         response = client.post('/admin/providers', headers=auth, json={'name':'Jev', 'provider_type':'typesafe', 'api_key':'fake'}); assert response.status_code == 201
         provider_id = response.json()['id']
         race_model = client.post('/admin/models', headers=auth, json={'alias':'verify-race', 'provider_id':provider_id, 'upstream_model':'jev-latest', 'operations':['decision']}).json()
@@ -366,67 +361,9 @@ try:
         assert outcomes[1] == 200 and outcomes[0] in (200, 409), outcomes
         race_model = next(m for m in client.get('/admin/models', headers=auth).json() if m['alias'] == 'verify-race')
         assert race_model['capabilities'][0]['verification_status'] == 'unverified'
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            list(pool.map(lambda _: circuits.record(test_engine, race_model['id'], 'decision', race_model['verification_version'], True), range(10)))
-        with Session(test_engine) as session:
-            state = session.get(ModelCircuit, (race_model['id'], 'decision', race_model['verification_version']))
-            assert state is not None and state.failure_count == 3 and state.open_until is not None
         response = client.post('/admin/models', headers=auth, json={'alias':'judge', 'provider_id':provider_id, 'upstream_model':'jev-latest', 'operations':['decision']}); assert response.status_code == 201
         model_id = response.json()['id']
         response = client.post('/admin/prices', headers=auth, json={'model_id':model_id, 'currency':'USD', 'basis':'question', 'per_question':'0.01'}); assert response.status_code == 201
-        backup = client.post('/admin/models', headers=auth, json={'alias':'judge-backup','provider_id':provider_id,'upstream_model':'jev-backup','operations':['decision']}).json()['id']
-        route_response = client.post('/admin/routes', headers=auth, json={'alias':'retry-judge','operation':'decision','retry_on_failure':True,'targets':[{'model_id':model_id,'priority':0},{'model_id':backup,'priority':1}]})
-        assert route_response.status_code == 201
-        retry_route_id = route_response.json()['id']
-        retry_key = client.post('/admin/api-keys', headers=auth, json={'name':'retry-key','model_ids':[model_id,backup]}).json()['key']
-        async def retry_decisions(config, data):
-            if config['model'] == 'typesafe/jev-latest': raise TimeoutError()
-            return {'model':'jev-backup','answers':[{'type':'predicate','name':'ok','probability':0.9}]}
-        providers.decision = retry_decisions
-        retried = client.post('/v1/decisions', headers={'Authorization':'Bearer '+retry_key}, json={'model':'retry-judge','input':'x','questions':[{'type':'predicate','name':'ok','instructions':'test?'}]})
-        assert retried.status_code == 200 and retried.headers['x-request-id'] != retried.headers['x-attempt-id']
-        attempts = [r for r in client.get('/admin/usage/requests', headers=auth).json() if r['root_request_id'] == retried.headers['x-request-id']]
-        assert sorted((r['attempt_number'], r['status']) for r in attempts) == [(1, 'error'), (2, 'success')]
-        selected = client.get('/admin/usage/requests', headers=auth, params={'root_request_id':retried.headers['x-request-id']}).json()
-        assert len(selected) == 2
-        retry_key_id = next(k['id'] for k in client.get('/admin/api-keys', headers=auth).json() if k['name'] == 'retry-key')
-        metrics = client.get('/admin/metrics', headers=auth, params={'key_id':retry_key_id}).json()
-        assert metrics['unique_requests'] == 1 and metrics['attempts'] == 2 and metrics['retry_attempts'] == 1
-        route_calls = []
-        async def replace_route_then_timeout(config, data):
-            route_calls.append(config['model'])
-            with Session(test_engine) as session:
-                session.get(ModelRoute, retry_route_id).alias = 'renamed-judge'
-                session.flush()
-                session.add(ModelRoute(alias='retry-judge', operation='decision', active=True, retry_on_failure=True,
-                    targets=[RouteTarget(model_id=backup, priority=0, weight=1)]))
-                session.commit()
-            raise TimeoutError()
-        old_decision = providers.decision
-        providers.decision = replace_route_then_timeout
-        try:
-            result = client.post('/v1/decisions', headers={'Authorization':'Bearer '+retry_key}, json={'model':'retry-judge','input':'x','questions':[{'type':'predicate','name':'ok','instructions':'test?'}]})
-            assert result.status_code == 504 and len(route_calls) == 1
-        finally:
-            providers.decision = old_decision
-        providers.decision = fake_decisions
-        openai = client.post('/admin/providers', headers=auth, json={'name':'openai-decision','provider_type':'openai','api_key':'fake'}).json()['id']
-        openai_model = client.post('/admin/models', headers=auth, json={'alias':'openai-decision','provider_id':openai,'upstream_model':'gpt-6-luna','operations':['decision']}).json()['id']
-        assert client.post('/admin/routes', headers=auth, json={'alias':'multi-judge','operation':'decision','targets':[{'model_id':model_id,'priority':0},{'model_id':openai_model,'priority':1}]}).status_code == 201
-        multi_key = client.post('/admin/api-keys', headers=auth, json={'name':'multi-decision','model_ids':[model_id,openai_model]}).json()['key']
-        original_decision = providers.decision
-        dispatched = []
-        async def mock_decision(config, data):
-            dispatched.append(config)
-            return {'answers':[{'type':'predicate','name':'ok','probability':0.9}]}
-        providers.decision = mock_decision
-        image = base64.b64encode(b'\x89PNG\r\n\x1a\nmock').decode()
-        body = {'model':'multi-judge','input':[{'type':'message','role':'user','content':[{'type':'input_image','image_url':'data:image/png;base64,'+image}]}],'questions':[{'type':'predicate','name':'ok','instructions':'test?'}]}
-        assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+multi_key}, json=body).status_code == 200
-        assert dispatched[-1]['model'] == 'openai/gpt-6-luna'
-        assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+multi_key,'TypeSafe-Danger-Zone-Images':'true'}, json=body).status_code == 200
-        assert dispatched[-1]['model'] == 'typesafe/jev-latest'
-        providers.decision = original_decision
         # Avoid a fixed-window rollover during the concurrency assertion.
         with test_engine.connect() as connection:
             second = int(connection.execute(text('SELECT EXTRACT(SECOND FROM now())')).scalar_one())
@@ -451,29 +388,17 @@ try:
         with ThreadPoolExecutor(max_workers=12) as pool:
             results = list(pool.map(attempt, range(12)))
         assert results.count(200) == 4 and results.count(429) == 8, results
-        routed = client.post('/admin/routes', headers=auth, json={'alias':'jev-route','operation':'decision',
-            'targets':[{'model_id':model_id,'priority':0,'weight':1}]})
-        assert routed.status_code == 201, routed.text
-        route_key = client.post('/admin/api-keys', headers=auth, json={'name':'route-key','model_ids':[model_id]}).json()['key']
-        route_call = client.post('/v1/decisions', headers={'Authorization':'Bearer '+route_key},
-            json={'model':'jev-route','input':'sample','questions':[{'type':'predicate','name':'ok','instructions':'Is this ok?'}]})
-        assert route_call.status_code == 200 and route_call.json()['model'] == 'jev-route'
-        route_records = client.get('/admin/usage/requests', headers=auth).json()
-        assert any(item['requested_alias'] == 'jev-route' and item['model_id'] == model_id for item in route_records)
-        def alias_race(kind):
-            with Session(test_engine) as session:
-                try:
-                    if kind == 'model':
-                        create_model(ModelIn(alias='race-alias', provider_id=provider_id, upstream_model='jev-race', operations=['decision']), session, 'admin:1')
-                    else:
-                        create_route(RouteIn(alias='race-alias', operation='decision', targets=[{'model_id':model_id}]), session, 'admin:1')
-                    return 201
-                except HTTPException as error:
-                    session.rollback()
-                    return error.status_code
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            race = list(pool.map(alias_race, ['model','route']))
-        assert sorted(race) == [201, 409], race
+        # Legacy routing configuration stays stored but no longer dispatches.
+        with Session(test_engine) as session:
+            old_route = ModelRoute(alias='legacy-judge-route', operation='decision', active=True, retry_on_failure=True)
+            session.add(old_route); session.flush()
+            session.add(RouteTarget(route_id=old_route.id, model_id=model_id, priority=0, weight=1))
+            session.commit(); old_route_id = old_route.id
+        assert client.get('/admin/routes', headers=auth).status_code == 404
+        assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+raw}, json={**payload, 'model':'legacy-judge-route'}).status_code == 403
+        with Session(test_engine) as session:
+            assert session.get(ModelRoute, old_route_id) is not None
+            assert len(session.scalars(select(RouteTarget).where(RouteTarget.route_id == old_route_id)).all()) == 1
         lock_key = client.post('/admin/api-keys', headers=auth, json={'name':'lock-test','model_ids':[model_id]}).json()
         bounded_engine = runtime_engine(test_url, lock_timeout_ms=2000, statement_timeout_ms=5000)
         def get_bounded_db():
@@ -490,16 +415,16 @@ try:
             # Catalog DDL locks can block even a SELECT. Model lookup must not
             # block the ASGI loop while this unrelated request waits.
             with Session(test_engine) as holder, ThreadPoolExecutor(max_workers=1) as pool:
-                holder.execute(text('LOCK TABLE model_routes IN ACCESS EXCLUSIVE MODE'))
+                holder.execute(text('LOCK TABLE model_registrations IN ACCESS EXCLUSIVE MODE'))
                 waiting = pool.submit(client.post, '/v1/decisions', headers={'Authorization':'Bearer '+lock_key['key']}, json=payload)
                 try:
                     deadline = time.monotonic() + 1.5
                     while time.monotonic() < deadline:
                         with test_engine.connect() as connection:
-                            blocked = connection.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%model_routes%'"))
+                            blocked = connection.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%model_registrations%'"))
                         if blocked: break
                         time.sleep(0.02)
-                    assert blocked, 'request did not reach the route lock'
+                    assert blocked, 'request did not reach the model lock'
                     before = time.monotonic()
                     assert client.get('/health/live').status_code == 200
                     assert time.monotonic() - before < 1, 'model selection blocked the event loop'
@@ -735,7 +660,7 @@ try:
             assert len(active) == 1 and active[0].id in (1, race_user)
             sessions = session.scalars(select(AdminSession).where(AdminSession.token_hash.in_([f'{1:064x}', f'{2:064x}']))).all()
             assert len(sessions) == 2 and all(item.revoked == (item.user_id != active[0].id) for item in sessions)
-    print('PostgreSQL migrations, accounts, mocked Jev, pricing, audit, limits, legacy budget retention, routing and retention passed')
+    print('PostgreSQL migrations, accounts, mocked Jev, pricing, audit, limits, legacy budget and route retention, and retention passed')
 finally:
     app.dependency_overrides.clear()
     test_engine.dispose()

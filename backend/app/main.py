@@ -25,8 +25,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from .database import engine
 from .request_limit import BodyLimitMiddleware
-from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OperationalPolicy, ModelCircuit, ModelRoute, RouteTarget, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
-from . import circuits, observability, providers, rate_limit
+from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OperationalPolicy, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
+from . import observability, providers, rate_limit
 from .security import cipher, decrypt_secret, encrypt_secret, hash_key, new_client_key, password_hash, password_verify, valid_bootstrap_token
 
 app = FastAPI(title="Magpie", version="0.2.0")
@@ -274,19 +274,6 @@ class KeyIn(StrictModel):
 
 class KeyUpdate(KeyIn):
     pass
-
-
-class RouteTargetIn(StrictModel):
-    model_id: int = Field(gt=0)
-    priority: int = Field(default=0, ge=0, le=1000)
-    weight: int = Field(default=1, ge=1, le=1000)
-
-
-class RouteIn(StrictModel):
-    alias: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
-    operation: Literal["generation", "embedding", "decision"]
-    targets: list[RouteTargetIn] = Field(min_length=1, max_length=20)
-    retry_on_failure: bool = False
 
 
 class RetentionIn(StrictModel):
@@ -785,62 +772,16 @@ def decision_capability_error(row: ModelRegistration, body: DecisionIn, images_o
     return None
 
 
-def permitted_model(db: Session, key: ClientKey, alias: str, operation: str, request_body: ChatIn | EmbeddingIn | DecisionIn | None = None, excluded_ids: set[int] | None = None, images_opt_in: bool = False, expected_route_id: int | None = None) -> ModelRegistration:
-    base = select(ModelRegistration).join(ClientKeyGrant, ClientKeyGrant.model_id == ModelRegistration.id).join(ProviderConnection)
-    row = db.scalar(base.where(ClientKeyGrant.client_key_id == key.id, ModelRegistration.alias == alias,
-        ModelRegistration.active.is_(True), ProviderConnection.active.is_(True)).options(
-            selectinload(ModelRegistration.provider), selectinload(ModelRegistration.capabilities)))
-    if row and not excluded_ids:
-        if operation not in [c.operation for c in row.capabilities]:
-            raise HTTPException(403, "Model or operation is not available for this API key")
-        if not row.provider.encrypted_api_key:
-            raise HTTPException(503, "Provider credentials are not configured")
-        return row
-    route_query = select(ModelRoute).where(ModelRoute.alias == alias, ModelRoute.active.is_(True), ModelRoute.operation == operation)
-    if expected_route_id is not None:
-        route_query = route_query.where(ModelRoute.id == expected_route_id, ModelRoute.retry_on_failure.is_(True))
-    route = db.scalar(route_query)
-    if route is None:
+def permitted_model(db: Session, key: ClientKey, alias: str, operation: str) -> ModelRegistration:
+    row = db.scalar(select(ModelRegistration).join(ClientKeyGrant, ClientKeyGrant.model_id == ModelRegistration.id)
+        .join(ProviderConnection).where(ClientKeyGrant.client_key_id == key.id, ModelRegistration.alias == alias,
+            ModelRegistration.active.is_(True), ProviderConnection.active.is_(True))
+        .options(selectinload(ModelRegistration.provider), selectinload(ModelRegistration.capabilities)))
+    if not row or operation not in [cap.operation for cap in row.capabilities]:
         raise HTTPException(403, "Model or operation is not available for this API key")
-    candidates = db.execute(select(ModelRegistration, RouteTarget.priority, RouteTarget.weight)
-        .join(RouteTarget, RouteTarget.model_id == ModelRegistration.id)
-        .join(ClientKeyGrant, ClientKeyGrant.model_id == ModelRegistration.id)
-        .join(ProviderConnection, ProviderConnection.id == ModelRegistration.provider_id)
-        .join(ModelCapability, ModelCapability.model_id == ModelRegistration.id)
-        .where(RouteTarget.route_id == route.id, ClientKeyGrant.client_key_id == key.id,
-               ModelRegistration.active.is_(True), ProviderConnection.active.is_(True),
-               ProviderConnection.encrypted_api_key.is_not(None), ProviderConnection.encrypted_api_key != '', ModelCapability.operation == operation)
-        .options(selectinload(ModelRegistration.provider), selectinload(ModelRegistration.capabilities))).all()
-    if not candidates:
-        raise HTTPException(403, "Model or operation is not available for this API key")
-    if excluded_ids:
-        candidates = [candidate for candidate in candidates if candidate[0].id not in excluded_ids]
-        if not candidates:
-            raise HTTPException(503, "No untried route targets are available")
-    if isinstance(request_body, EmbeddingIn):
-        candidates = [candidate for candidate in candidates if embedding_limit_error(candidate[0], request_body) is None]
-        if not candidates:
-            raise HTTPException(400, "No eligible route target supports this embedding input")
-    elif isinstance(request_body, ChatIn):
-        candidates = [candidate for candidate in candidates if generation_capability_error(candidate[0], request_body) is None]
-        if not candidates:
-            raise HTTPException(400, "No eligible route target supports the requested generation features")
-    elif isinstance(request_body, DecisionIn):
-        candidates = [candidate for candidate in candidates if decision_capability_error(candidate[0], request_body, images_opt_in) is None]
-        if not candidates:
-            raise HTTPException(400, "No eligible route target supports the requested decision features")
-    available = circuits.available_ids(db, candidates, operation)
-    candidates = [candidate for candidate in candidates if candidate[0].id in available]
-    if not candidates:
-        raise HTTPException(503, "All eligible route targets are cooling down")
-    priority = min(candidate.priority for candidate in candidates)
-    eligible = [candidate for candidate in candidates if candidate.priority == priority]
-    draw = secrets.randbelow(sum(candidate.weight for candidate in eligible))
-    for candidate in eligible:
-        draw -= candidate.weight
-        if draw < 0:
-            return candidate[0]
-    raise RuntimeError("No route target selected")
+    if not row.provider.encrypted_api_key:
+        raise HTTPException(503, "Provider credentials are not configured")
+    return row
 
 
 def upstream_config(row: ModelRegistration):
@@ -1135,8 +1076,6 @@ def create_model(body: ModelIn, db: DB, _: Admin):
     lock_catalog(db)
     if len(body.operations) != 1:
         raise HTTPException(422, 'Choose one model operation')
-    if db.scalar(select(ModelRoute.id).where(ModelRoute.alias == body.alias)):
-        raise HTTPException(409, "Alias already belongs to a route")
     p = validate_model(db, body)
     row = ModelRegistration(alias=body.alias, upstream_model=body.upstream_model, provider=p, active=True,
         description=body.description, embedding_dimensions=body.embedding_dimensions, embedding_space=body.embedding_space, max_input_tokens=body.max_input_tokens,
@@ -1153,8 +1092,6 @@ def create_model(body: ModelIn, db: DB, _: Admin):
 @app.put("/admin/models/{model_id}")
 def update_model(model_id: int, body: ModelIn, db: DB, actor: Admin):
     lock_catalog(db)
-    if db.scalar(select(ModelRoute.id).where(ModelRoute.alias == body.alias)):
-        raise HTTPException(409, "Alias already belongs to a route")
     row = db.scalar(select(ModelRegistration).where(ModelRegistration.id == model_id).with_for_update())
     if not row:
         raise HTTPException(404, "Model not found")
@@ -1179,13 +1116,6 @@ def update_model(model_id: int, body: ModelIn, db: DB, actor: Admin):
                 status='unverified', note='Model configuration or capability changed', actor=actor, created_at=datetime.now(timezone.utc)))
             cap.verification_status = 'unverified'
     row.alias, row.upstream_model, row.provider = body.alias, body.upstream_model, provider
-    for route in db.scalars(select(ModelRoute).join(RouteTarget).where(RouteTarget.model_id == model_id, ModelRoute.operation == "embedding").options(selectinload(ModelRoute.targets))):
-        if len(route.targets) > 1:
-            other_ids = [target.model_id for target in route.targets if target.model_id != model_id]
-            others = db.scalars(select(ModelRegistration).where(ModelRegistration.id.in_(other_ids))).all()
-            if ("embedding" not in body.operations or not body.embedding_space or not body.embedding_dimensions or
-                any(other.embedding_space != body.embedding_space or other.embedding_dimensions != body.embedding_dimensions for other in others)):
-                raise HTTPException(409, "Remove model from embedding routes before changing its embedding space")
     row.description, row.embedding_dimensions, row.embedding_space, row.max_input_tokens = body.description, body.embedding_dimensions, body.embedding_space, body.max_input_tokens
     row.supports_embedding_batch, row.embedding_max_batch_size = body.supports_embedding_batch, body.embedding_max_batch_size
     row.supports_streaming, row.supports_tools, row.supports_reasoning = body.supports_streaming, body.supports_tools, body.supports_reasoning
@@ -1228,102 +1158,6 @@ def capability_verification_history(model_id: int, db: DB, _: Admin, limit: int 
         .order_by(CapabilityVerificationEvent.id.desc()).limit(limit))
     return [{'id': event.id, 'operation': event.operation, 'previous_status': event.previous_status,
              'status': event.status, 'note': event.note, 'actor': event.actor, 'created_at': event.created_at} for event in events]
-
-
-@app.get('/admin/model-circuits')
-def model_circuits(db: DB, _: Admin):
-    now = db.scalar(select(func.now()))
-    rows = db.execute(select(ModelCircuit, ModelRegistration).join(ModelRegistration, ModelCircuit.model_id == ModelRegistration.id)
-        .where(ModelCircuit.config_version == ModelRegistration.verification_version).order_by(ModelCircuit.model_id)).all()
-    return [{'model_id': circuit.model_id, 'alias': model.alias, 'operation': circuit.operation,
-             'failure_count': circuit.failure_count, 'open_until': circuit.open_until,
-             'cooling_down': circuit.open_until is not None and circuit.open_until > now} for circuit, model in rows]
-
-
-@app.delete('/admin/models/{model_id}/capabilities/{operation}/circuit', status_code=204)
-def reset_model_circuit(model_id: int, operation: Literal['generation', 'embedding', 'decision'], db: DB, actor: Admin):
-    model = db.scalar(select(ModelRegistration).where(ModelRegistration.id == model_id).with_for_update())
-    if model is None or not any(cap.operation == operation for cap in model.capabilities):
-        raise HTTPException(404, 'Model capability not found')
-    db.execute(delete(ModelCircuit).where(ModelCircuit.model_id == model_id, ModelCircuit.operation == operation,
-                                           ModelCircuit.config_version == model.verification_version))
-    observability.audit(db, 'model.circuit.reset', 'model', model_id, actor=actor)
-    commit(db)
-
-
-def validate_route(db: Session, body: RouteIn):
-    ids = [target.model_id for target in body.targets]
-    if len(set(ids)) != len(ids):
-        raise HTTPException(422, "Route target models must be unique")
-    matching = set(db.scalars(select(ModelCapability.model_id).where(ModelCapability.model_id.in_(ids), ModelCapability.operation == body.operation)).all())
-    if matching != set(ids):
-        raise HTTPException(422, "All targets must support the route operation")
-    if body.operation == "embedding" and len(ids) > 1:
-        models = db.scalars(select(ModelRegistration).where(ModelRegistration.id.in_(ids))).all()
-        spaces = {(model.embedding_space, model.embedding_dimensions) for model in models}
-        if len(spaces) != 1 or any(not space or not dimensions for space, dimensions in spaces):
-            raise HTTPException(422, "Embedding route targets require the same explicit space and dimensions")
-
-
-def route_info(route: ModelRoute):
-    return {"id": route.id, "alias": route.alias, "operation": route.operation, "active": route.active, "retry_on_failure": route.retry_on_failure,
-            "targets": [{"model_id": t.model_id, "priority": t.priority, "weight": t.weight} for t in route.targets]}
-
-
-@app.post("/admin/routes", status_code=201)
-def create_route(body: RouteIn, db: DB, actor: Admin):
-    lock_catalog(db)
-    if db.scalar(select(ModelRegistration.id).where(ModelRegistration.alias == body.alias)):
-        raise HTTPException(409, "Alias already belongs to a model")
-    validate_route(db, body)
-    route = ModelRoute(alias=body.alias, operation=body.operation, active=True, retry_on_failure=body.retry_on_failure,
-                       targets=[RouteTarget(**target.model_dump()) for target in body.targets])
-    db.add(route)
-    flush(db)
-    observability.audit(db, "route.create", "route", route.id, actor=actor)
-    commit(db)
-    return route_info(route)
-
-
-@app.get("/admin/routes")
-def list_routes(db: DB, _: Admin):
-    routes = db.scalars(select(ModelRoute).options(selectinload(ModelRoute.targets)).order_by(ModelRoute.alias)).all()
-    return [route_info(route) for route in routes]
-
-
-@app.put("/admin/routes/{route_id}")
-def update_route(route_id: int, body: RouteIn, db: DB, actor: Admin):
-    lock_catalog(db)
-    route = db.scalar(select(ModelRoute).where(ModelRoute.id == route_id).options(selectinload(ModelRoute.targets)).with_for_update())
-    if not route:
-        raise HTTPException(404, "Route not found")
-    if db.scalar(select(ModelRegistration.id).where(ModelRegistration.alias == body.alias)):
-        raise HTTPException(409, "Alias already belongs to a model")
-    validate_route(db, body)
-    route.alias, route.operation, route.retry_on_failure = body.alias, body.operation, body.retry_on_failure
-    wanted = {target.model_id: target for target in body.targets}
-    current = {target.model_id: target for target in route.targets}
-    for model_id, target in current.items():
-        if model_id not in wanted:
-            route.targets.remove(target)
-        else:
-            target.priority, target.weight = wanted[model_id].priority, wanted[model_id].weight
-    for model_id in wanted.keys() - current.keys():
-        route.targets.append(RouteTarget(**wanted[model_id].model_dump()))
-    observability.audit(db, "route.update", "route", route.id, actor=actor)
-    commit(db)
-    return route_info(route)
-
-
-@app.put("/admin/routes/{route_id}/active")
-def set_route_active(route_id: int, body: ActiveIn, db: DB, actor: Admin):
-    route = db.get(ModelRoute, route_id)
-    if not route:
-        raise HTTPException(404, "Route not found")
-    route.active = body.active
-    observability.audit(db, "route.activate" if body.active else "route.deactivate", "route", route.id, actor=actor)
-    commit(db)
-    return {"id": route.id, "active": route.active}
 
 
 @app.post("/admin/api-keys", status_code=201)
@@ -1424,14 +1258,6 @@ def available_models(db: DB, key: Client):
                                         ProviderConnection.encrypted_api_key.is_not(None), ProviderConnection.encrypted_api_key != '')
         .options(selectinload(ModelRegistration.capabilities))).all()
     data = [{"id": row.alias, "object": "model", "owned_by": "magpie", "operations": [c.operation for c in row.capabilities]} for row in rows]
-    routes = db.execute(select(ModelRoute.alias, ModelRoute.operation).join(RouteTarget, RouteTarget.route_id == ModelRoute.id)
-        .join(ModelRegistration, ModelRegistration.id == RouteTarget.model_id).join(ProviderConnection)
-        .join(ClientKeyGrant, ClientKeyGrant.model_id == ModelRegistration.id)
-        .join(ModelCapability, ModelCapability.model_id == ModelRegistration.id)
-        .where(ClientKeyGrant.client_key_id == key.id, ModelRoute.active.is_(True), ModelRegistration.active.is_(True),
-               ProviderConnection.active.is_(True), ProviderConnection.encrypted_api_key.is_not(None), ProviderConnection.encrypted_api_key != '',
-               ModelCapability.operation == ModelRoute.operation).distinct()).all()
-    data.extend({"id": alias, "object": "model", "owned_by": "magpie", "operations": [operation]} for alias, operation in routes)
     return {"object": "list", "data": data}
 
 
@@ -1669,133 +1495,88 @@ async def db_work(work):
 
 
 async def invoke(body, operation, db, key, fn, decision_images_enabled=False):
-    # A route may opt in to one extra attempt before any response is sent.
-    def initial_route():
-        route = db.scalar(select(ModelRoute).where(ModelRoute.alias == body.model, ModelRoute.operation == operation, ModelRoute.active.is_(True)))
-        return (bool(route and route.retry_on_failure and not (operation == "generation" and body.stream)), route.id if route else None)
-    retry_enabled, initial_route_id = await db_work(initial_route)
-    tried: set[int] = set()
-    root_request_id = None
-    last_error = None
     key_id = key.id
-    for attempt in range(1, 3 if retry_enabled else 2):
-        def select_attempt():
-            if attempt > 1:
-                # Honor key revocation and route changes before another dispatch.
-                active_key = db.scalar(select(ClientKey.id).where(ClientKey.id == key_id, ClientKey.active.is_(True), or_(ClientKey.expires_at.is_(None), ClientKey.expires_at > func.now())))
-                active_route = db.scalar(select(ModelRoute.id).where(ModelRoute.id == initial_route_id, ModelRoute.alias == body.model, ModelRoute.operation == operation, ModelRoute.active.is_(True), ModelRoute.retry_on_failure.is_(True)))
-                if not active_key or not active_route:
-                    raise last_error
-            row = permitted_model(db, key, body.model, operation, body, tried or None, decision_images_enabled, initial_route_id if attempt > 1 else None)
-            if operation == "generation":
-                error = generation_capability_error(row, body)
-                if error:
-                    raise HTTPException(400, error)
-            if operation == "embedding":
-                error = embedding_limit_error(row, body)
-                if error:
-                    raise HTTPException(400, error)
-            if operation == "decision":
-                error = decision_capability_error(row, body, decision_images_enabled)
-                if error:
-                    raise HTTPException(400, error)
-            config = upstream_config(row)
-            uncertain_embedding_usage = operation == 'embedding' and row.provider.provider_type == 'gemini'
-            embedding_dimensions = row.embedding_dimensions if operation == 'embedding' else None
-            if operation == "decision" and row.provider.provider_type == "typesafe" and body.requires_images_opt_in():
-                config['extra_headers'] = {'TypeSafe-Danger-Zone-Images': 'true'}
-            snapshot = {'provider_id_snapshot': row.provider.id, 'provider_type_snapshot': row.provider.provider_type,
-                        'provider_name_snapshot': row.provider.name, 'upstream_model_snapshot': row.upstream_model}
-            return (row.id, row.verification_version, row.pricing_version, config, snapshot,
-                    uncertain_embedding_usage, embedding_dimensions)
+    def select_model():
+        row = permitted_model(db, key, body.model, operation)
+        if operation == "generation":
+            error = generation_capability_error(row, body)
+        elif operation == "embedding":
+            error = embedding_limit_error(row, body)
+        else:
+            error = decision_capability_error(row, body, decision_images_enabled)
+        if error:
+            raise HTTPException(400, error)
+        config = upstream_config(row)
+        uncertain_embedding_usage = operation == 'embedding' and row.provider.provider_type == 'gemini'
+        embedding_dimensions = row.embedding_dimensions if operation == 'embedding' else None
+        if operation == "decision" and row.provider.provider_type == "typesafe" and body.requires_images_opt_in():
+            config['extra_headers'] = {'TypeSafe-Danger-Zone-Images': 'true'}
+        snapshot = {'provider_id_snapshot': row.provider.id, 'provider_type_snapshot': row.provider.provider_type,
+                    'provider_name_snapshot': row.provider.name, 'upstream_model_snapshot': row.upstream_model}
+        return row.id, row.pricing_version, config, snapshot, uncertain_embedding_usage, embedding_dimensions
+    model_id, pricing_version, config, model_snapshot, uncertain_embedding_usage, embedding_dimensions = await db_work(select_model)
+    bind = db.get_bind()
+    def record_attempt():
+        rate_limit.consume(db, key)
+        return observability.begin(db, key_id, model_id, operation,
+            len(body.questions) if operation == "decision" else None, pricing_version, body.model,
+            model_snapshot=model_snapshot)
+    pending_record = asyncio.create_task(asyncio.to_thread(record_attempt))
+    try:
+        request_id, started = await asyncio.shield(pending_record)
+    except asyncio.CancelledError:
         try:
-            (model_id, verification_version, pricing_version, config, model_snapshot,
-             uncertain_embedding_usage, embedding_dimensions) = await db_work(select_attempt)
-        except HTTPException:
-            if last_error:
-                raise last_error
-            raise
-        bind = db.get_bind()
-        circuit = (model_id, operation, verification_version)
-        tried.add(model_id)
-        def record_attempt():
-            if attempt == 1:
-                rate_limit.consume(db, key)
-            return observability.begin(db, key_id, model_id, operation,
-                len(body.questions) if operation == "decision" else None, pricing_version, body.model, root_request_id, attempt, model_snapshot)
-        pending_record = asyncio.create_task(asyncio.to_thread(record_attempt))
-        try:
-            # These synchronous transactions can wait for database row locks.
-            # Keep that wait off the ASGI event loop so unrelated requests and
-            # ongoing provider streams can continue.
-            request_id, started = await asyncio.shield(pending_record)
-        except asyncio.CancelledError:
-            # A worker thread cannot be cancelled while it is committing.
-            # Wait for it and finalize any committed request record as interrupted.
-            try:
-                cancelled_id, cancelled_started = await pending_record
-            except Exception:
-                db.rollback()
-            else:
-                await observability.finish(bind, cancelled_id, cancelled_started, 'interrupted')
-            raise
-        except HTTPException as exc:
-            db.rollback()
-            if root_request_id:
-                exc.headers = {**(exc.headers or {}), "X-Request-ID": root_request_id}
-            raise
-        root_request_id = root_request_id or request_id
-        headers = {"X-Request-ID": root_request_id, "X-Attempt-ID": request_id}
-        try:
-            # HTTP clients and provider adapters can interpret their timeout
-            # differently. Bound the await independently before any response.
-            async with asyncio.timeout(providers.UPSTREAM_TIMEOUT_SECONDS):
-                result = await fn(config, body.model_dump(exclude={"model"}, exclude_none=True))
-        except asyncio.CancelledError:
-            await observability.finish(bind, request_id, started, "interrupted")
-            raise
-        except Exception as exc:
-            upstream_status = getattr(exc, "status_code", None)
-            retryable = not isinstance(upstream_status, int) or upstream_status in (408, 429) or upstream_status >= 500
-            await observability.finish(bind, request_id, started, "error", circuit=circuit, circuit_failed=True if retryable else None)
-            if isinstance(exc, (TimeoutError, providers.litellm.Timeout)) or upstream_status in (408, 504):
-                status, message = 504, "Provider request timed out"
-            elif upstream_status in (400, 429, 503):
-                status, message = upstream_status, "Provider rejected the request" if upstream_status == 400 else "Provider is unavailable"
-            else:
-                status, message = 502, "Provider request failed"
-            last_error = HTTPException(status, message, headers=headers)
-            if retryable and attempt == 1 and retry_enabled:
-                continue
-            raise last_error from None
-        if operation == "generation" and body.stream:
-            return StreamingResponse(observability.tracked_stream(result, body.model, bind, request_id, started, circuit, model_snapshot['provider_type_snapshot']),
-                                     media_type="text/event-stream", headers={"Cache-Control": "no-cache", **headers})
-        try:
-            data = providers.as_dict(result)
-            if not isinstance(data, dict):
-                raise ValueError("Invalid provider response")
-            if operation == 'generation':
-                validate_generation_response(data)
-                providers.apply_generation_usage(data, result, model_snapshot['provider_type_snapshot'])
-            if operation == 'embedding':
-                validate_embedding_response(data, body, embedding_dimensions)
-                providers.apply_embedding_usage(data, result)
-            if operation == 'decision':
-                validate_decision_response(data, body)
-                providers.apply_decision_usage(data, result)
-            if uncertain_embedding_usage and not isinstance(result, providers.EmbeddingProvenance):
-                # LiteLLM can synthesize Gemini embedding usage locally without
-                # indicating its provenance. Do not report it as provider usage.
-                data.pop('usage', None)
-            data["model"] = body.model
-            response = JSONResponse(jsonable_encoder(data), headers=headers)
-            await observability.finish(bind, request_id, started, "success", data.get("usage"), circuit, False)
-            return response
+            cancelled_id, cancelled_started = await pending_record
         except Exception:
-            await observability.finish(bind, request_id, started, "error", circuit=circuit, circuit_failed=True)
-            raise HTTPException(502, "Provider response failed", headers=headers) from None
-    raise last_error
+            db.rollback()
+        else:
+            await observability.finish(bind, cancelled_id, cancelled_started, 'interrupted')
+        raise
+    except HTTPException:
+        db.rollback()
+        raise
+    headers = {"X-Request-ID": request_id, "X-Attempt-ID": request_id}
+    try:
+        async with asyncio.timeout(providers.UPSTREAM_TIMEOUT_SECONDS):
+            result = await fn(config, body.model_dump(exclude={"model"}, exclude_none=True))
+    except asyncio.CancelledError:
+        await observability.finish(bind, request_id, started, "interrupted")
+        raise
+    except Exception as exc:
+        upstream_status = getattr(exc, "status_code", None)
+        await observability.finish(bind, request_id, started, "error")
+        if isinstance(exc, (TimeoutError, providers.litellm.Timeout)) or upstream_status in (408, 504):
+            status, message = 504, "Provider request timed out"
+        elif upstream_status in (400, 429, 503):
+            status, message = upstream_status, "Provider rejected the request" if upstream_status == 400 else "Provider is unavailable"
+        else:
+            status, message = 502, "Provider request failed"
+        raise HTTPException(status, message, headers=headers) from None
+    if operation == "generation" and body.stream:
+        return StreamingResponse(observability.tracked_stream(result, body.model, bind, request_id, started, model_snapshot['provider_type_snapshot']),
+                                 media_type="text/event-stream", headers={"Cache-Control": "no-cache", **headers})
+    try:
+        data = providers.as_dict(result)
+        if not isinstance(data, dict):
+            raise ValueError("Invalid provider response")
+        if operation == 'generation':
+            validate_generation_response(data)
+            providers.apply_generation_usage(data, result, model_snapshot['provider_type_snapshot'])
+        if operation == 'embedding':
+            validate_embedding_response(data, body, embedding_dimensions)
+            providers.apply_embedding_usage(data, result)
+        if operation == 'decision':
+            validate_decision_response(data, body)
+            providers.apply_decision_usage(data, result)
+        if uncertain_embedding_usage and not isinstance(result, providers.EmbeddingProvenance):
+            data.pop('usage', None)
+        data["model"] = body.model
+        response = JSONResponse(jsonable_encoder(data), headers=headers)
+        await observability.finish(bind, request_id, started, "success", data.get("usage"))
+        return response
+    except Exception:
+        await observability.finish(bind, request_id, started, "error")
+        raise HTTPException(502, "Provider response failed", headers=headers) from None
 
 
 class ModelTestIn(StrictModel):
