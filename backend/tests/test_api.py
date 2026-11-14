@@ -2990,11 +2990,15 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
+    reasoning = {'id':'stream-1','object':'chat.completion.chunk','created':1,'model':'mock','choices':[{'index':0,'delta':{'reasoning_content':'thinking'},'finish_reason':None}]}
     chunk = {'id':'stream-1','object':'chat.completion.chunk','created':1,'model':'mock','choices':[{'index':0,'delta':{'content':'hello'},'finish_reason':None}]}
     finish = {'id':'stream-1','object':'chat.completion.chunk','created':1,'model':'mock','choices':[{'index':0,'delta':{},'finish_reason':'stop'}]}
     usage_chunk = {'id':'stream-1','object':'chat.completion.chunk','created':1,'model':'mock','choices':[],'usage':raw_usage}
-    wire = ''.join('data: '+json.dumps(value)+'\n\n' for value in ([chunk,finish] + ([usage_chunk] if raw_usage is not None else []))) + 'data: [DONE]\n\n'
-    def handler(request): return httpx2.Response(200, text=wire, headers={'content-type':'text/event-stream'})
+    wire = ''.join('data: '+json.dumps(value)+'\n\n' for value in ([reasoning,chunk,finish] + ([usage_chunk] if raw_usage is not None else []))) + 'data: [DONE]\n\n'
+    observed = []
+    def handler(request):
+        observed.append(json.loads(request.content))
+        return httpx2.Response(200, text=wire, headers={'content-type':'text/event-stream'})
     original = providers.completion
     async def fake_transport(config, data):
         http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
@@ -3019,6 +3023,8 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
     response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'test-chat','messages':[{'role':'user','content':'x'}],'stream':True,'stream_options':{'include_usage':True}})
     assert response.status_code == 200 and '[DONE]' in response.text and 'Provider stream failed' not in response.text
     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
+    assert any(event.get('choices') and event['choices'][0]['delta'].get('reasoning_content') == 'thinking' for event in events)
+    assert observed[0]['stream_options']['include_usage'] is True
     usage_events = [event['usage'] for event in events if event.get('usage') is not None]
     if raw_usage is None:
         assert usage_events == []
