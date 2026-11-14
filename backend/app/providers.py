@@ -84,6 +84,10 @@ DISCOVERY_BASES = {
     'openrouter': 'https://openrouter.ai/api/v1',
     'deepseek': 'https://api.deepseek.com',
     'groq': 'https://api.groq.com/openai/v1',
+    'cerebras': 'https://api.cerebras.ai/v1',
+    'novita': 'https://api.novita.ai/openai/v1',
+    # Fireworks' public account, not the caller's private account catalog.
+    'fireworks_ai': 'https://api.fireworks.ai/v1/accounts/fireworks',
     'mistral': 'https://api.mistral.ai/v1',
 }
 
@@ -111,6 +115,8 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
         headers = {'x-api-key': secret, 'anthropic-version': '2023-06-01', 'Accept':'application/json'}
     elif provider_type == 'gemini':
         headers = {'x-goog-api-key': secret, 'Accept':'application/json'}
+    elif provider_type == 'novita':
+        headers['Content-Type'] = 'application/json'
     try:
         models, seen, cursors = [], set(), set()
         params, partial = {}, False
@@ -136,7 +142,7 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                         payload = json.loads(b''.join(chunks))
                     except (ValueError, UnicodeError, RecursionError):
                         raise DiscoveryError('invalid_response') from None
-                    items = payload.get('models' if provider_type in ('typesafe', 'gemini') else 'data') if isinstance(payload, dict) else None
+                    items = payload.get('models' if provider_type in ('typesafe', 'gemini', 'fireworks_ai') else 'data') if isinstance(payload, dict) else None
                     if not isinstance(items, list):
                         raise DiscoveryError('invalid_response')
                     for item in items:
@@ -145,18 +151,18 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                             break
                         if not isinstance(item, dict):
                             continue
-                        name = item.get('name' if provider_type in ('typesafe', 'gemini') else 'id')
+                        name = item.get('name' if provider_type in ('typesafe', 'gemini', 'fireworks_ai') else 'id')
                         if provider_type == 'gemini' and isinstance(name, str):
                             name = name.removeprefix('models/')
                         if not isinstance(name, str) or not name or len(name) > 200 or name in seen:
                             continue
                         seen.add(name)
-                        label = item.get('displayName') if provider_type == 'gemini' else item.get('name')
+                        label = item.get('displayName') if provider_type in ('gemini', 'fireworks_ai') else item.get('name')
                         models.append({'id': name, 'name': label[:200] if isinstance(label, str) else name})
                     more = bool(payload.get('has_more') or payload.get('nextPageToken'))
                     if partial or not more:
                         break
-                    if provider_type == 'gemini':
+                    if provider_type in ('gemini', 'fireworks_ai'):
                         cursor, key = payload.get('nextPageToken'), 'pageToken'
                     elif provider_type in ('openai', 'anthropic'):
                         cursor, key = payload.get('last_id'), 'after' if provider_type == 'openai' else 'after_id'
@@ -170,7 +176,7 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                     params = {key: cursor}
                     if page == 9:
                         partial = True
-        return {'models': models, 'partial': partial}
+        return {'models': models, 'partial': partial or provider_type == 'fireworks_ai'}
 
     except DiscoveryError:
         raise

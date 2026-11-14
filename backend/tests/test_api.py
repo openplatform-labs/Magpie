@@ -3495,6 +3495,9 @@ def test_documented_api_examples_with_mock_providers(context, monkeypatch):
     ('gemini', 'https://generativelanguage.googleapis.com/v1beta/models', 'x-goog-api-key', {'models':[{'name':'models/gemini-test'}]}, 'gemini-test'),
     ('typesafe', 'https://api.typesafe.ai/v1/models', 'authorization', {'models':[{'name':'jev-latest'}]}, 'jev-latest'),
     ('exaone', 'https://api.exaone.ai/v1/models', 'authorization', {'data':[{'id':'k-exaone-test'}]}, 'k-exaone-test'),
+    ('cerebras', 'https://api.cerebras.ai/v1/models', 'authorization', {'data':[{'id':'cerebras-test'}]}, 'cerebras-test'),
+    ('novita', 'https://api.novita.ai/openai/v1/models', 'authorization', {'data':[{'id':'vendor/novita-test'}]}, 'vendor/novita-test'),
+    ('fireworks_ai', 'https://api.fireworks.ai/v1/accounts/fireworks/models', 'authorization', {'models':[{'name':'accounts/fireworks/models/test','displayName':'Test'}]}, 'accounts/fireworks/models/test'),
 ])
 def test_provider_discovery_uses_bounded_mock_transport(context, monkeypatch, kind, path, header, payload, expected):
     import httpx
@@ -3508,13 +3511,14 @@ def test_provider_discovery_uses_bounded_mock_transport(context, monkeypatch, ki
         assert str(request.url) == path
         assert request.headers[header].endswith('synthetic-secret')
         if kind == 'anthropic': assert request.headers['anthropic-version'] == '2023-06-01'
+        if kind == 'novita': assert request.headers['content-type'] == 'application/json'
         return httpx.Response(200, json=payload)
     original = providers.httpx.AsyncClient
     monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
     result = client.post(f'/admin/providers/{provider_id}/discover', headers=admin())
     assert result.status_code == 200, result.text
     assert result.json()['models'][0]['id'] == expected
-    assert result.json()['partial'] is (kind == 'anthropic')
+    assert result.json()['partial'] is (kind in ('anthropic', 'fireworks_ai'))
     assert len(seen) == 1 and 'synthetic-secret' not in result.text
     assert any(row['action'] == 'provider.discover' for row in client.get('/admin/audit', headers=admin()).json())
     assert client.post(f'/admin/providers/{provider_id}/discover').status_code == 401
@@ -3556,6 +3560,26 @@ def test_provider_discovery_pagination_is_bounded(context, monkeypatch, kind, fi
     assert response.status_code == 200
     assert [item['id'] for item in response.json()['models']] == ['a','b']
     assert response.json()['partial'] is False and len(seen) == 2
+
+
+def test_fireworks_public_catalog_pagination_without_network(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'fireworks','provider_type':'fireworks_ai','api_key':'synthetic'}).json()['id']
+    seen = []
+    def handler(request):
+        seen.append(request)
+        assert request.url.host == 'api.fireworks.ai'
+        if len(seen) == 1:
+            return httpx.Response(200, json={'models':[{'name':'accounts/fireworks/models/a', 'displayName':'A'}], 'nextPageToken':'next'})
+        assert request.url.params['pageToken'] == 'next'
+        return httpx.Response(200, json={'models':[{'name':'accounts/fireworks/models/b'}]})
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 200
+    assert response.json() == {'models':[{'id':'accounts/fireworks/models/a','name':'A'}, {'id':'accounts/fireworks/models/b','name':'accounts/fireworks/models/b'}], 'partial':True}
+    assert len(seen) == 2
 
 
 def test_provider_discovery_never_follows_redirect(context, monkeypatch):
