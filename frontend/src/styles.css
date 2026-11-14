@@ -57,3 +57,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .drawer-close { border: 0; background: transparent; color: #526b78; font-size: 28px; line-height: 1; cursor: pointer; }
 .drawer:focus { outline: none; }
 @media (max-width: 600px) { .drawer.panel { padding: 22px 20px 32px; } }
+
+.drawer.panel fieldset.drawer-fields { margin: 0; padding: 0; border: 0; }
+.drawer.panel fieldset.drawer-fields label { display: block; margin-right: 0; }
