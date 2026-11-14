@@ -108,6 +108,9 @@ for operation, registered in [('generation', chat), ('decision', judge)]:
     print(f'24 concurrent mocked {operation} requests passed; usage and costs agree')
 
 soak_seconds = int(os.environ.get('MAGPIE_HA_SOAK_SECONDS', '0'))
+soak_workers = int(os.environ.get('MAGPIE_HA_SOAK_WORKERS', '4'))
+if not 1 <= soak_workers <= 32:
+    raise ValueError('MAGPIE_HA_SOAK_WORKERS must be between 1 and 32')
 if not 0 <= soak_seconds <= 3600:
     raise ValueError('MAGPIE_HA_SOAK_SECONDS must be between 0 and 3600')
 if soak_seconds:
@@ -123,8 +126,8 @@ if soak_seconds:
             count += 1
             time.sleep(0.05)
         return count
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        counts = list(pool.map(soak_worker, range(4)))
+    with ThreadPoolExecutor(max_workers=soak_workers) as pool:
+        counts = list(pool.map(soak_worker, range(soak_workers)))
     total = sum(counts)
     assert min(counts) > 0
     status, summaries = request('GET', f"/admin/usage?key_id={soak_key['id']}", admin)
@@ -133,7 +136,7 @@ if soak_seconds:
     assert summary['status'] == 'success' and summary['requests'] == total
     assert summary['input_tokens'] == 2 * total and summary['cost_records'] == total
     assert Decimal(summary['estimated_cost']) == Decimal('0.02') * total
-    print(f'HA soak workers=4 seconds={soak_seconds} requests={total}; usage and costs agree')
+    print(f'HA soak workers={soak_workers} seconds={soak_seconds} requests={total}; usage and costs agree')
 
 # The bootstrap credential is retired when the first admin is created, so this
 # test must run after the workload that uses it.

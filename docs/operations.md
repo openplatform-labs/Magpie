@@ -162,7 +162,7 @@ Venice AI의 고정 주소는 [공식 Chat Completions API](https://docs.venice.
 
 `docker compose exec -T backend python - < backend/tests/load_smoke.py`는 임시 PostgreSQL DB에서 모의 동시 요청·요청 제한·사용량을 확인합니다. `sh backend/tests/ha_load.sh`는 격리된 두 백엔드와 프록시에서 동일한 작업과 공유 제한을 검증합니다. 실제 공급자 호출은 하지 않습니다.
 
-`MAGPIE_SOAK_SECONDS`와 `MAGPIE_HA_SOAK_SECONDS`로 모의 지속 부하의 시간을 지정할 수 있습니다(0~3600초). 이 시험은 실제 공급자나 장시간 운영 검증을 대신하지 않습니다.
+`MAGPIE_SOAK_SECONDS`와 `MAGPIE_HA_SOAK_SECONDS`로 모의 지속 부하의 시간을 지정할 수 있습니다(0~3600초). `MAGPIE_HA_SOAK_WORKERS`는 동시 작업 수를 1~32개로 지정하며 기본값은 4입니다. 이 시험은 실제 공급자나 장시간 운영 검증을 대신하지 않습니다.
 
 2026-11-14의 PostgreSQL 19 RC 모의 부하 관측은 해당 환경의 단기 결과이며 운영 처리량이나 장시간 안정성을 보증하지 않습니다.
 
