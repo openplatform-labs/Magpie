@@ -43,6 +43,8 @@ console.log('A completed model or key save does not close another selection.');
 
 const originalExpiry = '2026-11-01T06:30:42.123Z';
 component.editKey({...key(3), expires_at:originalExpiry});
+component.toggleTimePicker('editExpiry'); const beforePickerSave = requests.length;
+component.saveKey(); assert.equal(requests.length, beforePickerSave); component.pickerField = null;
 component.editKeyName = 'renamed'; component.saveKey();
 assert.equal(requests.at(-1)?.body.expires_at, originalExpiry);
 requests.at(-1)!.result.next({}); requests.at(-1)!.result.complete();

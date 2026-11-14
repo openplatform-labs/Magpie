@@ -17,6 +17,7 @@ for (const url of ['/admin/metrics', '/admin/usage', '/admin/usage/requests']) {
   assert(params); assert.equal(params.get('start'), start); assert.equal(params.get('end'), end);
 }
 const previousCount = requests.length;
+component.toggleTimePicker('usageStart'); component.submitUsageFilters(); assert.equal(requests.length, previousCount); component.pickerField = null;
 component.usageStart = '2026-02-29:1200'; component.refreshObservability(); assert.equal(requests.length, previousCount);
 component.usageStart = '2026-11-14:1030'; component.refreshObservability(); assert.equal(requests.length, previousCount); assert(component.error.includes('늦어야'));
 component.usageStart = '2026-11-14:0905'; component.refreshObservability(); assert.equal(component.error, ''); assert.equal(requests.length, previousCount + 4);
