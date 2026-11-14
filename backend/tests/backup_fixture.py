@@ -3,6 +3,7 @@ import os
 import socket
 import sys
 from decimal import Decimal
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -11,7 +12,7 @@ from sqlalchemy.engine import make_url
 from app import providers
 from app.database import engine
 from app.main import app
-from app.models import ClientKey, ProviderConnection
+from app.models import BudgetAdjustment, BudgetReservation, ClientKey, KeyBudget, ProviderConnection
 from app.security import decrypt_secret, hash_key
 
 # Database connections use libpq; provider clients must never reach the network.
@@ -60,13 +61,18 @@ with TestClient(app) as client:
             db.get(ProviderConnection, provider['id']).encrypted_api_key = LEGACY_CIPHERTEXT
             db.commit()
         assert client.post('/admin/prices', headers=admin, json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-        assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin, json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
+        legacy = client.post('/admin/api-keys', headers=admin, json={'name':'backup-legacy-key','model_ids':[model['id']]}).json()
         assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+TEST_KEY}, json={'model':'backup-model','input':'sample'}).status_code == 200
-        failed = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+TEST_KEY}, json={'model':'backup-model','input':'fail'})
+        failed = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+legacy['key']}, json={'model':'backup-model','input':'fail'})
         assert failed.status_code == 504
         request_id = failed.headers['x-request-id']
-        assert client.post('/admin/budget-reservations/'+request_id+'/reconcile', headers=admin, json={'settled_amount':'0.02','note':'backup-reconciliation'}).status_code == 200
-        assert client.post('/admin/budget-reservations/'+request_id+'/adjustments', headers=admin, json={'id':'backup-adjustment','expected_amount':'0.02','revised_amount':'0.025','note':'backup-invoice'}).status_code == 200
+        with Session(engine()) as db:
+            db.add(KeyBudget(client_key_id=legacy['id'], currency='USD', limit_amount=Decimal('1'), reserve_per_request=Decimal('.1'), spent_amount=Decimal('.025'), held_amount=Decimal('0')))
+            db.flush()
+            db.add(BudgetReservation(request_id=request_id, client_key_id=legacy['id'], reserved_amount=Decimal('.1'), settled_amount=Decimal('.025'), status='manual', reconciliation_note='backup-reconciliation', reconciliation_actor='admin:1', reconciled_at=datetime.now(timezone.utc), reconciliation_forced=False))
+            db.flush()
+            db.add(BudgetAdjustment(id='backup-adjustment', request_id=request_id, previous_amount=Decimal('.02'), revised_amount=Decimal('.025'), note='backup-invoice', actor='admin:1', created_at=datetime.now(timezone.utc)))
+            db.commit()
         assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+TEST_KEY}, json={'model':'backup-model','input':'unknown'}).status_code == 200
     elif sys.argv[1] == 'verify':
         assert client.get('/health/ready').status_code == 200
@@ -80,19 +86,17 @@ with TestClient(app) as client:
         assert sum(row['status'] == 'success' and row['input_tokens'] == 3 for row in usage) == 1
         assert sum(row['status'] == 'success' and row['input_tokens'] is None for row in usage) == 1
         failed = next(row for row in usage if row['status'] == 'error')
-        history = client.get('/admin/budget-reservations/'+failed['request_id']+'/adjustments', headers=admin).json()
-        assert history['reconciliation_note'] == 'backup-reconciliation' and history['reconciliation_actor'].startswith('admin:')
-        assert history['reconciliation_forced'] is False and history['reconciled_at'] is not None
-        assert Decimal(history['settled_amount']) == Decimal('0.025')
-        assert len(history['adjustments']) == 1 and history['adjustments'][0]['note'] == 'backup-invoice'
-        pending = client.get('/admin/budget-reservations', headers=admin).json()
-        assert len(pending) == 1 and pending[0]['pending_reason'] == 'usage_unavailable'
-        assert pending[0]['missing_input_tokens'] is True and Decimal(pending[0]['reserved_amount']) == Decimal('0.1')
-        budget = client.get('/admin/budgets', headers=admin).json()[0]
-        assert Decimal(budget['spent_amount']) == Decimal('0.055') and Decimal(budget['held_amount']) == Decimal('0.1')
         with Session(engine()) as db:
+            legacy = db.query(ClientKey).filter_by(name='backup-legacy-key').one()
+            budget = db.get(KeyBudget, legacy.id)
+            reservation = db.get(BudgetReservation, failed['request_id'])
+            adjustment = db.get(BudgetAdjustment, 'backup-adjustment')
+            assert Decimal(budget.spent_amount) == Decimal('.025') and Decimal(budget.held_amount) == 0
+            assert reservation.reconciliation_note == 'backup-reconciliation' and Decimal(reservation.settled_amount) == Decimal('.025')
+            assert adjustment.note == 'backup-invoice'
             secret = db.query(ProviderConnection).one().encrypted_api_key
             assert secret == LEGACY_CIPHERTEXT and decrypt_secret(secret) == PROVIDER_KEY
+        assert next(item for item in client.get('/admin/api-keys', headers=admin).json() if item['id'] == legacy.id)['legacy_budget'] is True
         assert client.get('/v1/models', headers={'Authorization':'Bearer '+TEST_KEY}).json()['data'][0]['id'] == 'backup-model'
         assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+TEST_KEY}, json={'model':'backup-model','input':'restored'}).status_code == 200
     else:

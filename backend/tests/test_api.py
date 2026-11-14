@@ -154,6 +154,39 @@ def configure(client, operations=None):
     assert k.status_code == 201
     return p.json()['id'], m.json()['id'], k.json()
 
+def test_legacy_budget_keys_fail_closed_and_keep_financial_history(context, monkeypatch):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from app.models import BudgetReservation, KeyBudget, UsageRecord
+    client, db = context
+    _, model, key = configure(client, ['embedding'])
+    with Session(db) as session:
+        session.add(KeyBudget(client_key_id=key['id'], currency='USD', limit_amount=Decimal('1'),
+                              reserve_per_request=Decimal('.1'), spent_amount=Decimal('.2'), held_amount=Decimal('.1')))
+        session.add(UsageRecord(request_id='legacy-request', client_key_id=key['id'], model_id=model,
+                                operation='embedding', status='started', started_at=datetime.now(timezone.utc)))
+        session.flush()
+        session.add(BudgetReservation(request_id='legacy-request', client_key_id=key['id'],
+                                      reserved_amount=Decimal('.1'), status='pending'))
+        session.commit()
+    calls = []
+    async def fake_embedding(config, data):
+        calls.append(True)
+        return {'data':[{'index':0,'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2}}
+    monkeypatch.setattr(providers, 'embedding', fake_embedding)
+    old_headers = {'Authorization':'Bearer '+key['key']}
+    assert client.post('/v1/embeddings', headers=old_headers, json={'model':'exaone-chat','input':'sample'}).status_code == 403
+    assert calls == []
+    listed = client.get('/admin/api-keys', headers=admin()).json()
+    assert next(item for item in listed if item['id'] == key['id'])['legacy_budget'] is True
+    replacement = client.post('/admin/api-keys', headers=admin(), json={'name':'replacement','model_ids':[model]}).json()
+    assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+replacement['key']}, json={'model':'exaone-chat','input':'sample'}).status_code == 200
+    with Session(db) as session:
+        assert session.get(KeyBudget, key['id']).held_amount == Decimal('.1')
+        assert session.get(BudgetReservation, 'legacy-request').status == 'pending'
+        assert session.get(UsageRecord, 'legacy-request') is not None
+    assert client.get('/admin/budgets', headers=admin()).status_code == 404
+
 def test_provider_credential_health_is_read_only_and_never_returns_secrets(context):
     client, db = context
     valid = client.post('/admin/providers', headers=admin(), json={'name':'valid','provider_type':'exaone','api_key':'private-provider-secret'}).json()['id']
@@ -464,7 +497,6 @@ def test_embedding_response_validation_and_budget_reservation(context, monkeypat
     provider, model, key = configure(client, ['embedding'])
     assert client.put('/admin/models/'+str(model), headers=admin(), json={'alias':'exaone-chat','provider_id':provider,'upstream_model':'embed','operations':['embedding'],'embedding_dimensions':2}).status_code == 200
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     responses = []
     calls = []
     async def fake(config, data):
@@ -484,8 +516,6 @@ def test_embedding_response_validation_and_budget_reservation(context, monkeypat
     responses.extend(invalid)
     for _ in invalid:
         assert client.post('/v1/embeddings', headers=auth, json=payload).status_code == 502
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['spent_amount']) == 0 and Decimal(budget['held_amount']) == Decimal('0.1') * len(invalid)
     encoded = base64.b64encode(struct.pack('<ff', 0.1, 0.2)).decode()
     responses.append([{'index':1,'embedding':encoded},{'index':0,'embedding':encoded}])
     result = client.post('/v1/embeddings', headers=auth, json={**payload,'dimensions':2,'encoding_format':'base64'})
@@ -729,15 +759,12 @@ def test_invalid_generation_response_never_settles(context, monkeypatch, bad_cho
     client, _ = context
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     async def malformed(config, data): return {'choices':bad_choices,'usage':{'prompt_tokens':10,'completion_tokens':10}}
     monkeypatch.setattr(providers, 'completion', malformed)
     response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'exaone-chat','messages':[{'role':'user','content':'test'}]})
     assert response.status_code == 502
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 @pytest.mark.parametrize(('message', 'reason'), [
@@ -760,7 +787,6 @@ def test_unserializable_response_is_not_settled_as_success(context, monkeypatch)
     client, _ = context
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     async def malformed(config, data):
         return {'choices':[{'index':0,'message':{'role':'assistant','content':'ok'},'finish_reason':'stop'}], 'invalid':float('nan'), 'usage':{'prompt_tokens':10,'completion_tokens':10}}
     monkeypatch.setattr(providers, 'completion', malformed)
@@ -768,8 +794,6 @@ def test_unserializable_response_is_not_settled_as_success(context, monkeypatch)
     assert response.status_code == 502
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 @pytest.mark.parametrize('operation', ['embedding', 'decision'])
@@ -790,15 +814,12 @@ def test_provider_error_with_apparently_valid_result_is_not_settled(context, mon
         price = {'basis':'question','per_question':'0.01'}
         path = '/v1/decisions'
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD',**price}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fake(config, data): return {**result, 'error':{'message':'provider-secret-error'}}
     monkeypatch.setattr(providers, operation, fake)
     response = client.post(path, headers={'Authorization':'Bearer '+key['key']}, json=payload)
     assert response.status_code == 502 and 'provider-secret-error' not in response.text
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 def test_usage_error_and_stream_usage(context, monkeypatch):
@@ -828,7 +849,6 @@ def test_usage_snapshots_survive_model_changes(context, monkeypatch):
     client, _ = context
     provider_id, model_id, key = configure(client, ['embedding'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'operation':'embedding','currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fail(config, data): raise TimeoutError()
     monkeypatch.setattr(providers, 'embedding', fail)
     response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+key['key']}, json={'model':'exaone-chat','input':'private text'})
@@ -836,8 +856,7 @@ def test_usage_snapshots_survive_model_changes(context, monkeypatch):
     other = client.post('/admin/providers', headers=admin(), json={'name':'new-provider','provider_type':'openai','api_key':'other-fake-secret'}).json()['id']
     assert client.put(f'/admin/models/{model_id}', headers=admin(), json={'alias':'new-alias','provider_id':other,'upstream_model':'different-model','operations':['embedding']}).status_code == 200
     usage = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    pending = client.get('/admin/budget-reservations', headers=admin()).json()[0]
-    for row in (usage, pending):
+    for row in (usage,):
         assert (row['provider_id_snapshot'], row['provider_type_snapshot'], row['provider_name_snapshot'], row['upstream_model_snapshot']) == (provider_id, 'exaone', 'LG', 'k-exaone_v2.5')
         assert row['requested_alias'] == 'exaone-chat'
         assert 'private text' not in str(row) and 'provider-secret' not in str(row)
@@ -848,7 +867,6 @@ def test_truncated_and_failed_streams_never_emit_done_or_settle(context, monkeyp
     client, _ = context
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     cases = ['truncated','error_chunk','exception','no_choices']
     async def fake(config, data):
         case = cases.pop(0)
@@ -867,8 +885,6 @@ def test_truncated_and_failed_streams_never_emit_done_or_settle(context, monkeyp
         assert 'partial' in response.text and 'exaone-chat' in response.text
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 4 and all(r['status'] == 'error' and r['estimated_cost'] is None for r in records)
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.4') and Decimal(budget['spent_amount']) == 0
 
 
 @pytest.mark.parametrize('chunks', [
@@ -885,7 +901,6 @@ def test_malformed_stream_is_not_settled(context, monkeypatch, chunks):
     client, _ = context
     _, model_id, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fake(config, data):
         async def stream():
             for chunk in chunks:
@@ -896,9 +911,7 @@ def test_malformed_stream_is_not_settled(context, monkeypatch, chunks):
     result = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'exaone-chat','messages':[{'role':'user','content':'x'}],'stream':True})
     assert result.status_code == 200 and 'Provider stream failed' in result.text and '[DONE]' not in result.text
     usage = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     assert usage['status'] == 'error' and usage['estimated_cost'] is None
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 def test_incremental_function_tool_stream(context, monkeypatch):
@@ -920,7 +933,6 @@ def test_all_stream_choices_must_finish_before_settlement(context, monkeypatch):
     client, _ = context
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     cases = iter(['complete', 'incomplete', 'missing_index'])
     async def fake(config, data):
         case = next(cases)
@@ -940,8 +952,6 @@ def test_all_stream_choices_must_finish_before_settlement(context, monkeypatch):
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert sum(row['status'] == 'success' for row in records) == 1
     assert sum(row['status'] == 'error' and row['estimated_cost'] is None for row in records) == 2
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.2') and Decimal(budget['spent_amount']) == Decimal('0.00002')
 
 
 @pytest.mark.parametrize(('operation', 'path', 'payload'), [
@@ -954,7 +964,6 @@ def test_provider_stall_before_response_times_out_without_settlement(context, mo
     client, _ = context
     _, model, key = configure(client)
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'operation':operation,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     cancelled = []
     async def stalled(config, data):
         try:
@@ -968,8 +977,6 @@ def test_provider_stall_before_response_times_out_without_settlement(context, mo
     assert cancelled == [True]
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 @pytest.mark.parametrize('worker_fails', [False, True])
@@ -1040,7 +1047,6 @@ def test_stalled_stream_times_out_and_preserves_reservation(context, monkeypatch
     client, _ = context
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     closed = []
     async def fake(config, data):
         async def chunks():
@@ -1057,8 +1063,6 @@ def test_stalled_stream_times_out_and_preserves_reservation(context, monkeypatch
     assert '[DONE]' not in response.text and closed == [True]
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
 
 
 def test_client_stream_close_marks_interrupted_and_closes_provider(monkeypatch):
@@ -1254,7 +1258,6 @@ def test_multi_operation_model_uses_operation_specific_prices(context, monkeypat
     assert client.post('/admin/prices', headers=admin(), json={**token_price,'operation':'embedding','input_per_million':'100','output_per_million':'0'}).status_code == 201
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'operation':'decision','currency':'USD','basis':'question','per_question':'0.2'}).status_code == 201
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'operation':'embedding','currency':'USD','basis':'question','per_question':'0.2'}).status_code == 422
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.01'}).status_code == 200
     async def completion(config, data): return {'choices':[{'index':0,'message':{'role':'assistant','content':'ok'},'finish_reason':'stop'}], 'usage':{'prompt_tokens':100,'completion_tokens':20}}
     async def embedding(config, data): return {'data':mock_vectors(data['input']), 'usage':{'prompt_tokens':100}}
     async def decision(config, data): return {'answers':[{'type':'predicate','name':'q','probability':0.5}], 'usage':{'input_tokens':100,'output_tokens':0}}
@@ -1269,8 +1272,6 @@ def test_multi_operation_model_uses_operation_specific_prices(context, monkeypat
     assert Decimal(records['generation']['estimated_cost']) == Decimal('0.00014')
     assert Decimal(records['embedding']['estimated_cost']) == Decimal('0.01')
     assert Decimal(records['decision']['estimated_cost']) == Decimal('0.2')
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['spent_amount']) == Decimal('0.21014') and Decimal(budget['held_amount']) == 0
     assert {p['operation'] for p in client.get('/admin/prices', headers=admin()).json()} == {'generation','embedding','decision'}
 
 
@@ -1294,7 +1295,6 @@ def test_decision_validates_answers_and_preserves_refusals(context, monkeypatch)
     client, _ = context
     _, model, key = configure_jev(client)
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     questions = [
         {'type':'predicate','name':'p','instructions':'yes?'},
         {'type':'choice','name':'c','instructions':'pick','choices':[{'value':True},{'value':'maybe'}]},
@@ -1330,9 +1330,6 @@ def test_decision_validates_answers_and_preserves_refusals(context, monkeypatch)
     responses.extend(bad)
     for _ in bad:
         assert client.post('/v1/decisions', headers=headers, json=payload).status_code == 502
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['spent_amount']) == Decimal('0.08') and Decimal(budget['held_amount']) == Decimal('0.1') * len(bad)
-    assert len(client.get('/admin/budget-reservations', headers=admin()).json()) == len(bad)
 
 
 def test_admin_last_account_and_password_reset(context):
@@ -1585,7 +1582,6 @@ def test_typesafe_missing_usage_is_not_fabricated_or_settled(context, monkeypatc
     client, _ = context
     _, model, key = configure_jev(client)
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'1000000','output_per_million':'1000000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'100','reserve_per_request':'1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -1614,8 +1610,6 @@ def test_typesafe_missing_usage_is_not_fabricated_or_settled(context, monkeypatc
     assert records[second.headers['x-request-id']]['output_tokens'] is None and records[second.headers['x-request-id']]['estimated_cost'] is None
     assert Decimal(records[third.headers['x-request-id']]['estimated_cost']) == Decimal(7)
     assert Decimal(records[fourth.headers['x-request-id']]['estimated_cost']) == 0
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == 2 and Decimal(budget['spent_amount']) == 7
 
 
 @pytest.mark.parametrize('upstream_status,expected_status,raise_status', [(429, 429, True), (429, 429, False), (500, 502, True), (500, 502, False), (200, 502, False)])
@@ -1633,7 +1627,6 @@ def test_decision_upstream_failure_records_no_sensitive_data(context, monkeypatc
         model = client.post('/admin/models', headers=admin(), json={'alias':'judge','provider_id':provider['id'],'upstream_model':'gpt-test','operations':['decision']}).json()
         key = client.post('/admin/api-keys', headers=admin(), json={'name':'judge-key','model_ids':[model['id']]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'operation':'decision','currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'1'}).status_code == 200
     def no_network(*args, **kwargs):
         raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
@@ -1656,8 +1649,6 @@ def test_decision_upstream_failure_records_no_sensitive_data(context, monkeypatc
     assert response.status_code == expected_status
     records = client.get('/admin/usage/requests', headers=admin()).json()
     assert len(records) == 1 and records[0]['status'] == 'error' and records[0]['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == 1 and Decimal(budget['spent_amount']) == 0
     audit = client.get('/admin/audit', headers=admin()).json()
     assert all(secret not in str([response.json(), records, audit]) for secret in
                ('private customer text', 'private provider error', 'jev-secret', key['key']))
@@ -1723,7 +1714,6 @@ def test_openai_decision_adapter_roundtrip_without_network(context, monkeypatch)
     issued = client.post('/admin/api-keys', headers=admin(), json={'name':'openai','model_ids':[model.json()['id']]}).json()
     key = issued['key']
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model.json()['id'],'operation':'decision','currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{issued['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -1989,7 +1979,6 @@ def test_request_reservation_and_audit_cursor_pagination(context, monkeypatch):
     client, db = context
     _, model, key = configure_jev(client)
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'}).status_code == 200
     async def fail(config, data): raise TimeoutError()
     monkeypatch.setattr(providers, 'decision', fail)
     body = {'model':'judge','input':'x','questions':[{'type':'predicate','name':'q','instructions':'yes?'}]}
@@ -2013,11 +2002,9 @@ def test_request_reservation_and_audit_cursor_pagination(context, monkeypatch):
             params.update(before_started_at=timestamp, before_request_id=last['request_id'])
         return results
     records = all_pages('/admin/usage/requests', {'status':'error'})
-    reservations = all_pages('/admin/budget-reservations')
     ids = [row['request_id'] for row in records]
     assert len(ids) == len(set(ids)) == 5 and ids == sorted(ids, reverse=True)
-    assert [row['request_id'] for row in reservations] == ids
-    for path in ['/admin/usage/requests','/admin/budget-reservations']:
+    for path in ['/admin/usage/requests']:
         assert client.get(path, headers=admin(), params={'before_request_id':'x'}).status_code == 422
         assert client.get(path, headers=admin(), params={'before_started_at':'2026-01-01T00:00:00','before_request_id':'x'}).status_code == 422
     first = client.get('/admin/audit', headers=admin(), params={'limit':2}).json()
@@ -2034,7 +2021,6 @@ def test_operational_status_thresholds_and_stale_reservations(context, monkeypat
     assert client.get('/admin/operational-status').status_code == 401
     assert client.put('/admin/operational-policy', headers=admin(), json={'size_warning_bytes':1,'stale_after_minutes':10,'stale_count_warning':1}).status_code == 200
     assert client.put('/admin/operational-policy', headers=admin(), json={'size_warning_bytes':0,'stale_after_minutes':10,'stale_count_warning':1}).status_code == 422
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
     async def fail(config, data): raise TimeoutError()
     monkeypatch.setattr(providers, 'decision', fail)
@@ -2046,7 +2032,7 @@ def test_operational_status_thresholds_and_stale_reservations(context, monkeypat
         session.commit()
     status = client.get('/admin/operational-status', headers=admin()).json()
     assert status['database_size_bytes'] is None and status['size_warning'] is None
-    assert status['stale_started_requests'] == status['stale_pending_reservations'] == 1 and status['stale_warning'] is True
+    assert status['stale_started_requests'] == 1 and status['stale_warning'] is True
     assert client.put('/admin/operational-policy', headers=admin(), json={'size_warning_bytes':None,'stale_after_minutes':30,'stale_count_warning':1}).status_code == 200
     assert client.get('/admin/operational-status', headers=admin()).json()['stale_warning'] is False
     assert any(a['action'] == 'operational.policy.update' for a in client.get('/admin/audit', headers=admin()).json())
@@ -2066,7 +2052,6 @@ def test_invalid_provider_usage_keeps_budget_reserved(context, monkeypatch, usag
     client, _ = context
     _, model_id, key = configure(client, ['embedding'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id, 'currency':'USD', 'basis':'tokens', 'input_per_million':'10000', 'output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fake(config, data):
         return {'model':'mock', 'data':mock_vectors(data['input']), 'usage':usage}
     monkeypatch.setattr(providers, 'embedding', fake)
@@ -2074,61 +2059,10 @@ def test_invalid_provider_usage_keeps_budget_reserved(context, monkeypatch, usag
     assert response.status_code == 200
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['status'] == 'success' and record['input_tokens'] is None and record['total_tokens'] is None and record['estimated_cost'] is None
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.1') and Decimal(budget['spent_amount']) == 0
-    assert len(client.get('/admin/budget-reservations', headers=admin()).json()) == 1
 
 
-def test_budget_reservation_settlement_and_manual_reconciliation(context, monkeypatch):
-    from decimal import Decimal
-    client, _ = context
-    _, model, key = configure_jev(client)
-    auth = {'Authorization': 'Bearer ' + key['key']}
-    assert client.put('/admin/api-keys/'+str(key['id'])+'/budget', headers=admin(), json={'currency':'USD','limit_amount':'0.04','reserve_per_request':'0.02'}).status_code == 200
-    payload = {'model':'judge','input':'sample','questions':[{'type':'predicate','name':'x','instructions':'yes?'}]}
-    assert client.post('/v1/decisions', headers=auth, json=payload).status_code == 503  # No price configured.
-    assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
-    async def success(config, data): return {'model':'jev','answers':[{'type':'predicate','name':q['name'],'probability':0.5} for q in data['questions']]}
-    monkeypatch.setattr(providers, 'decision', success)
-    assert client.post('/v1/decisions', headers=auth, json=payload).status_code == 200
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(str(budget['spent_amount'])) == Decimal('0.01') and Decimal(str(budget['held_amount'])) == 0
-    async def fail(config, data): raise RuntimeError('timeout')
-    monkeypatch.setattr(providers, 'decision', fail)
-    assert client.post('/v1/decisions', headers=auth, json=payload).status_code == 502
-    assert client.post('/v1/decisions', headers=auth, json=payload).status_code == 429
-    pending = client.get('/admin/budget-reservations', headers=admin()).json()
-    assert len(pending) == 1 and pending[0]['request_status'] == 'error' and pending[0]['pending_reason'] == 'request_failed'
-    url = '/admin/budget-reservations/'+pending[0]['request_id']+'/reconcile'
-    assert client.post(url, headers=admin(), json={'settled_amount':'0','note':'Provider confirmed no charge'}).status_code == 200
-    history = client.get('/admin/budget-reservations/'+pending[0]['request_id']+'/adjustments', headers=admin()).json()
-    assert history['reconciliation_note'] == 'Provider confirmed no charge'
-    assert history['reconciliation_actor'] == 'bootstrap' and history['reconciled_at'] is not None
-    assert history['reconciliation_forced'] is False
-    assert client.post(url, headers=admin(), json={'settled_amount':'0','note':'Duplicate'}).status_code == 409
-    assert client.post('/v1/decisions', headers=auth, json=payload).status_code == 502
-    assert any(x['action'] == 'budget.reconcile' for x in client.get('/admin/audit', headers=admin()).json())
 
 
-def test_budget_failed_request_reservation_requires_explicit_force_if_started(context, monkeypatch):
-    client, db = context
-    _, model, key = configure_jev(client)
-    assert client.put('/admin/api-keys/'+str(key['id'])+'/budget', headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
-    assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
-    async def fail(config, data): raise RuntimeError('test')
-    monkeypatch.setattr(providers, 'decision', fail)
-    assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'judge','input':'x','questions':[{'type':'predicate','name':'q','instructions':'test?'}]}).status_code == 502
-    pending = client.get('/admin/budget-reservations', headers=admin()).json()[0]
-    from app.models import UsageRecord
-    with Session(db) as session:
-        row = session.get(UsageRecord, pending['request_id']); row.status = 'started'; session.commit()
-    assert client.get('/admin/budget-reservations', headers=admin()).json()[0]['pending_reason'] == 'in_progress_or_unfinished'
-    url = '/admin/budget-reservations/'+pending['request_id']+'/reconcile'
-    assert client.post(url, headers=admin(), json={'settled_amount':'0','note':'operator review'}).status_code == 409
-    assert client.post(url, headers=admin(), json={'settled_amount':'0','note':'operator review','force_started':True}).status_code == 200
-    history = client.get('/admin/budget-reservations/'+pending['request_id']+'/adjustments', headers=admin()).json()
-    assert history['reconciliation_forced'] is True and history['reconciliation_actor'] == 'bootstrap'
-    assert client.get('/admin/audit', headers=admin()).json()[0]['action'] == 'budget.reconcile_forced'
 
 
 def test_indeterminate_usage_resolution_and_late_completion(context, monkeypatch):
@@ -2137,7 +2071,6 @@ def test_indeterminate_usage_resolution_and_late_completion(context, monkeypatch
     from app.models import UsageRecord
     client, db = context
     _, model, key = configure_jev(client)
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
     async def fail(config, data): raise TimeoutError()
     monkeypatch.setattr(providers, 'decision', fail)
@@ -2155,52 +2088,21 @@ def test_indeterminate_usage_resolution_and_late_completion(context, monkeypatch
     assert client.get('/admin/metrics', headers=admin()).json()['unknown'] == 1
     record = client.get('/admin/usage/requests', headers=admin(), params={'status':'unknown'}).json()[0]
     assert record['resolution_note'] == 'worker stopped' and record['resolution_actor'] == 'bootstrap'
-    pending = client.get('/admin/budget-reservations', headers=admin()).json()[0]
-    assert pending['request_status'] == 'unknown' and pending['pending_reason'] == 'result_unknown'
-    reconcile = '/admin/budget-reservations/'+request_id+'/reconcile'
-    assert client.post(reconcile, headers=admin(), json={'settled_amount':'0','note':'checked'}).status_code == 409
     assert any(row['action'] == 'usage.resolve_unknown' for row in client.get('/admin/audit', headers=admin()).json())
     observability.end(db, request_id, time.monotonic(), 'success', {'input_tokens':3})
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['status'] == 'success' and record['resolution_note'] == 'worker stopped'
     assert client.get('/admin/metrics', headers=admin()).json()['unknown'] == 0
-    assert client.get('/admin/budget-reservations', headers=admin()).json() == []
 
 
-def test_budget_adjustments_are_audited_idempotent_and_optimistic(context, monkeypatch):
-    from decimal import Decimal
-    from app.models import UsageRecord
-    client, db = context
-    _, model, key = configure_jev(client)
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
-    assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
-    async def success(config, data): return {'model':'jev','answers':[{'type':'predicate','name':q['name'],'probability':0.5} for q in data['questions']]}
-    monkeypatch.setattr(providers, 'decision', success)
-    assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'judge','input':'x','questions':[{'type':'predicate','name':'q','instructions':'test?'}]}).status_code == 200
-    with Session(db) as session:
-        request_id = session.query(UsageRecord).one().request_id
-    url = f'/admin/budget-reservations/{request_id}/adjustments'
-    adjustment = {'id':'invoice-1','expected_amount':'0.01','revised_amount':'0.025','note':'Invoice 1'}
-    assert client.post(url, json=adjustment).status_code == 401
-    assert client.post(url, headers=admin(), json=adjustment).status_code == 200
-    assert client.post(url, headers=admin(), json=adjustment).status_code == 200
-    assert client.post(url, headers=admin(), json={**adjustment, 'revised_amount':'0.03'}).status_code == 409
-    assert client.post(url, headers=admin(), json={**adjustment, 'id':'invoice-2'}).status_code == 409
-    assert Decimal(client.get('/admin/budgets', headers=admin()).json()[0]['spent_amount']) == Decimal('0.025')
-    history = client.get(url, headers=admin()).json()
-    assert len(history['adjustments']) == 1 and Decimal(history['settled_amount']) == Decimal('0.025')
-    assert history['reconciliation_note'] is None and history['reconciliation_actor'] is None and history['reconciled_at'] is None
-    assert client.post(url, headers=admin(), json={'id':'invoice-2','expected_amount':'0.025','revised_amount':'0','note':'Credit'}).status_code == 200
-    assert Decimal(client.get('/admin/budgets', headers=admin()).json()[0]['spent_amount']) == 0
-    assert any(a['action'] == 'budget.adjust' for a in client.get('/admin/audit', headers=admin()).json())
 
 
 def test_retention_preserves_pending_and_budget_history(context, monkeypatch):
     from datetime import datetime, timedelta, timezone
-    from app.models import AuditLog, UsageRecord
+    from decimal import Decimal
+    from app.models import AuditLog, BudgetReservation, KeyBudget, UsageRecord
     client, db = context
     _, model, key = configure_jev(client)
-    assert client.put('/admin/api-keys/'+str(key['id'])+'/budget', headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'question','per_question':'0.01'}).status_code == 201
     async def fake(config, data): return {'model':'jev','answers':[{'type':'predicate','name':q['name'],'probability':0.5} for q in data['questions']]}
     monkeypatch.setattr(providers, 'decision', fake)
@@ -2210,6 +2112,8 @@ def test_retention_preserves_pending_and_budget_history(context, monkeypatch):
         budgeted = session.query(UsageRecord).one()
         budgeted_id = budgeted.request_id
         budgeted.started_at = old; budgeted.finished_at = old
+        session.add(KeyBudget(client_key_id=key['id'], currency='USD', limit_amount=Decimal('1'), reserve_per_request=Decimal('.1'), spent_amount=Decimal('.01'), held_amount=Decimal('0')))
+        session.add(BudgetReservation(request_id=budgeted_id, client_key_id=key['id'], reserved_amount=Decimal('.1'), settled_amount=Decimal('.01'), status='settled'))
         session.add(UsageRecord(request_id='old-finished',client_key_id=key['id'],model_id=model['id'],operation='decision',status='success',started_at=old,finished_at=old))
         session.add(UsageRecord(request_id='old-pending',client_key_id=key['id'],model_id=model['id'],operation='decision',status='started',started_at=old))
         session.add(AuditLog(created_at=old, actor='test',action='old',target_type='test',target_id='1'))
@@ -2303,7 +2207,6 @@ def test_opt_in_route_retry_tracks_each_attempt_and_budget(context, monkeypatch)
     route = client.post('/admin/routes', headers=admin(), json={'alias':'retry-route','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]})
     assert route.status_code == 201 and route.json()['retry_on_failure'] is True
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'retry-key','model_ids':[first,second]}).json()
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'0.1','reserve_per_request':'0.02'}).status_code == 200
     calls = []
     async def fake(config, data):
         calls.append(config['model'])
@@ -2324,13 +2227,6 @@ def test_opt_in_route_retry_tracks_each_attempt_and_budget(context, monkeypatch)
     assert metrics['success'] == 1 and metrics['errors'] == 1
     metrics = client.get('/admin/metrics', headers=admin(), params={'key_id':key['id'], 'status':'error'}).json()
     assert metrics['unique_requests'] == metrics['attempts'] == 1 and metrics['retry_attempts'] == 0
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
-    assert Decimal(budget['held_amount']) == Decimal('0.02') and Decimal(budget['spent_amount']) == Decimal('0.01')
-    pending = client.get('/admin/budget-reservations', headers=admin()).json()[0]
-    assert pending['request_id'] == records[0]['request_id']
-    assert pending['root_request_id'] == response.headers['x-request-id'] and pending['attempt_number'] == 1
-    assert pending['model_id'] == first and pending['requested_alias'] == 'retry-route'
-    assert pending['currency'] == 'USD' and pending['operation'] == 'embedding' and pending['finished_at'] is not None
 
 
 def test_retry_does_not_bypass_budget_or_retry_bad_request(context, monkeypatch):
@@ -2343,20 +2239,19 @@ def test_retry_does_not_bypass_budget_or_retry_bad_request(context, monkeypatch)
         assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'0','output_per_million':'0'}).status_code == 201
     assert client.post('/admin/routes', headers=admin(), json={'alias':'retry','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':first,'priority':0},{'model_id':second,'priority':1}]}).status_code == 201
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'budget','model_ids':[first,second]}).json()
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'0.02','reserve_per_request':'0.02'}).status_code == 200
     calls = []
     async def fail(config, data): calls.append(config['model']); raise TimeoutError()
     monkeypatch.setattr(providers, 'embedding', fail)
     auth = {'Authorization':'Bearer '+key['key']}
     response = client.post('/v1/embeddings', headers=auth, json={'model':'retry','input':'x'})
-    assert response.status_code == 429 and len(calls) == 1 and response.headers['x-request-id']
-    assert len(client.get('/admin/usage/requests', headers=admin()).json()) == 1
+    assert response.status_code == 504 and len(calls) == 2 and response.headers['x-request-id']
+    assert len(client.get('/admin/usage/requests', headers=admin()).json()) == 2
     class Invalid(Exception): status_code = 400
     async def invalid(config, data): calls.append(config['model']); raise Invalid()
     monkeypatch.setattr(providers, 'embedding', invalid)
     another = client.post('/admin/api-keys', headers=admin(), json={'name':'unlimited','model_ids':[first,second]}).json()
     response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+another['key']}, json={'model':'retry','input':'x'})
-    assert response.status_code == 400 and len(calls) == 2
+    assert response.status_code == 400 and len(calls) == 3
 
 
 def test_retry_respects_revocation_and_streaming_boundary(context, monkeypatch):
@@ -2626,7 +2521,6 @@ def test_exaone_missing_usage_does_not_settle_as_zero(context, monkeypatch, oper
     client, _ = context
     _, model_id, key = configure(client, [operation])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000' if operation == 'generation' else '0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -2645,20 +2539,14 @@ def test_exaone_missing_usage_does_not_settle_as_zero(context, monkeypatch, oper
     response = client.post(path, headers={'Authorization':'Bearer '+key['key']}, json=payload)
     assert response.status_code == 200, response.text
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     if billable:
         assert record['input_tokens'] == raw_usage['prompt_tokens'] and Decimal(record['estimated_cost']) == Decimal(raw_usage['prompt_tokens']) * Decimal('0.01')
-        assert Decimal(budget['held_amount']) == 0
         if operation == 'generation':
             assert record['output_tokens'] == 0 and response.json()['usage']['completion_tokens'] == 0
         else:
             assert response.json()['usage']['prompt_tokens'] == raw_usage['prompt_tokens']
     else:
-        assert record['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
-        pending = client.get('/admin/budget-reservations', headers=admin()).json()[0]
-        assert pending['pending_reason'] == 'usage_unavailable'
-        assert pending['missing_input_tokens'] is (operation == 'embedding' or raw_usage is None)
-        assert pending['missing_output_tokens'] is (operation == 'generation')
+        assert record['estimated_cost'] is None
 
 
 def test_reported_usage_capture_is_isolated_across_concurrent_calls(monkeypatch):
@@ -2707,7 +2595,6 @@ def test_openai_compatible_generation_rejects_success_status_with_error(context,
     _, model, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'operation':'generation','currency':'USD',
         'basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def handler(request):
         body = {'id':'mock','object':'chat.completion','created':1,'model':'mock',
             'choices':[{'index':0,'message':{'role':'assistant','content':'answer'},'finish_reason':'stop'}],
@@ -2723,11 +2610,10 @@ def test_openai_compatible_generation_rejects_success_status_with_error(context,
         json={'model':'exaone-chat','messages':[{'role':'user','content':'test'}]})
     assert response.status_code == expected and 'private provider error' not in response.text
     row = client.get('/admin/usage/requests',headers=admin()).json()[0]
-    budget = client.get('/admin/budgets',headers=admin()).json()[0]
     if error is not None:
-        assert row['status'] == 'error' and row['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
+        assert row['status'] == 'error' and row['estimated_cost'] is None
     else:
-        assert row['status'] == 'success' and Decimal(row['estimated_cost']) == Decimal('0.03') and Decimal(budget['held_amount']) == 0
+        assert row['status'] == 'success' and Decimal(row['estimated_cost']) == Decimal('0.03')
 
 
 @pytest.mark.parametrize('error,expected', [(None, 200), ({'message':'private provider error'}, 502)])
@@ -2739,7 +2625,6 @@ def test_openai_compatible_embedding_rejects_success_status_with_error(context, 
     _, model, key = configure(client, ['embedding'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model,'operation':'embedding','currency':'USD',
         'basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def handler(request):
         return httpx2.Response(200,json={'object':'list','model':'mock','data':[{'object':'embedding','index':0,'embedding':[0.1,0.2]}],
                                         'usage':{'prompt_tokens':2,'total_tokens':2},'error':error})
@@ -2752,11 +2637,10 @@ def test_openai_compatible_embedding_rejects_success_status_with_error(context, 
     response = client.post('/v1/embeddings', headers={'Authorization':'Bearer '+key['key']}, json={'model':'exaone-chat','input':'test'})
     assert response.status_code == expected and 'private provider error' not in response.text
     row = client.get('/admin/usage/requests',headers=admin()).json()[0]
-    budget = client.get('/admin/budgets',headers=admin()).json()[0]
     if error is not None:
-        assert row['status'] == 'error' and row['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
+        assert row['status'] == 'error' and row['estimated_cost'] is None
     else:
-        assert row['status'] == 'success' and Decimal(row['estimated_cost']) == Decimal('0.02') and Decimal(budget['held_amount']) == 0
+        assert row['status'] == 'success' and Decimal(row['estimated_cost']) == Decimal('0.02')
 
 
 def test_exaone_litellm_wire_format_with_mock_transport():
@@ -2835,7 +2719,6 @@ def test_gateway_stream_runs_litellm_over_mock_transport(context, monkeypatch, e
     client, _ = context
     _, model_id, key = configure(client, ['generation'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -2871,7 +2754,6 @@ def test_gateway_stream_runs_litellm_over_mock_transport(context, monkeypatch, e
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['status'] == ('success' if ending_kind == 'complete' else 'error')
     assert record['input_tokens'] is None and record['output_tokens'] is None and record['estimated_cost'] is None
-    assert len(client.get('/admin/budget-reservations', headers=admin()).json()) == 1
 
 
 @pytest.mark.parametrize(('raw_usage','expected_cost'), [
@@ -2893,7 +2775,6 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
     model_id = model['id']
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model_id]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -2940,11 +2821,10 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
     elif expected_cost is not None:
         assert usage_events[-1]['completion_tokens'] == raw_usage['completion_tokens']
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     if expected_cost is None:
-        assert record['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
+        assert record['estimated_cost'] is None
     else:
-        assert Decimal(record['estimated_cost']) == Decimal(expected_cost) and Decimal(budget['held_amount']) == 0
+        assert Decimal(record['estimated_cost']) == Decimal(expected_cost)
         assert record['input_tokens'] == raw_usage['prompt_tokens'] and record['output_tokens'] == raw_usage['completion_tokens']
 
 
@@ -2977,7 +2857,6 @@ def test_unknown_stream_source_never_bills_synthetic_usage(context, monkeypatch,
     model_id = model['id']
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model_id]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fake_completion(**kwargs):
         async def chunks():
             yield {'choices':[{'index':0,'delta':{'content':'test'},'finish_reason':None}]}
@@ -2992,7 +2871,6 @@ def test_unknown_stream_source_never_bills_synthetic_usage(context, monkeypatch,
     assert all(event.get('usage') is None for event in events)
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['estimated_cost'] is None
-    assert Decimal(client.get('/admin/budgets', headers=admin()).json()[0]['held_amount']) == Decimal('0.1')
 
 
 @pytest.mark.parametrize(('raw_usage', 'expected_cost'), [
@@ -3013,7 +2891,6 @@ def test_groq_native_stream_usage_without_network(context, monkeypatch, raw_usag
     model = client.post('/admin/models', headers=admin(), json={'alias':'groq-chat','provider_id':conn['id'],'upstream_model':'llama-3.3-70b-versatile','operations':['generation']}).json()
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model['id']]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -3037,15 +2914,14 @@ def test_groq_native_stream_usage_without_network(context, monkeypatch, raw_usag
     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
     usage_events = [event['usage'] for event in events if event.get('usage') is not None]
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     if raw_usage is None:
         assert not usage_events
     elif include_usage:
         assert usage_events and usage_events[-1]['prompt_tokens'] == raw_usage['prompt_tokens']
     if expected_cost is None:
-        assert record['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
+        assert record['estimated_cost'] is None
     else:
-        assert Decimal(record['estimated_cost']) == Decimal(expected_cost) and Decimal(budget['held_amount']) == 0
+        assert Decimal(record['estimated_cost']) == Decimal(expected_cost)
         assert record['input_tokens'] == raw_usage['prompt_tokens'] and record['output_tokens'] == raw_usage['completion_tokens']
 
 
@@ -3077,7 +2953,6 @@ def test_openai_like_native_stream_usage_without_network(context, monkeypatch, p
     model = client.post('/admin/models', headers=admin(), json={'alias':'test-chat','provider_id':conn['id'],'upstream_model':upstream_model,'operations':['generation']}).json()
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model['id']]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -3105,15 +2980,14 @@ def test_openai_like_native_stream_usage_without_network(context, monkeypatch, p
     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
     usage_events = [event['usage'] for event in events if event.get('usage') is not None]
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     if raw_usage is None:
         assert not usage_events
     else:
         assert usage_events and usage_events[-1]['prompt_tokens'] == raw_usage['prompt_tokens']
     if expected_cost is None:
-        assert record['estimated_cost'] is None and Decimal(budget['held_amount']) == Decimal('0.1')
+        assert record['estimated_cost'] is None
     else:
-        assert Decimal(record['estimated_cost']) == Decimal(expected_cost) and Decimal(budget['held_amount']) == 0
+        assert Decimal(record['estimated_cost']) == Decimal(expected_cost)
         assert record['input_tokens'] == raw_usage['prompt_tokens'] and record['output_tokens'] == raw_usage['completion_tokens']
 
 
@@ -3130,7 +3004,6 @@ def test_native_openai_like_stream_failures_without_network(context, monkeypatch
     model = client.post('/admin/models', headers=admin(), json={'alias':'test-chat','provider_id':conn['id'],'upstream_model':upstream_model,'operations':['generation']}).json()
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model['id']]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -3154,7 +3027,6 @@ def test_native_openai_like_stream_failures_without_network(context, monkeypatch
     assert 'private upstream error' not in response.text
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['status'] == 'error' and record['estimated_cost'] is None
-    assert Decimal(client.get('/admin/budgets', headers=admin()).json()[0]['held_amount']) == Decimal('0.1')
 
 
 def test_client_key_issuance_idempotency(context):
@@ -3187,7 +3059,6 @@ def test_embedding_callback_absent_never_trusts_synthetic_usage(context, monkeyp
     client, _ = context
     _, model_id, key = configure(client, ['embedding'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     async def fake_sdk(**kwargs):
         return {'object':'list','data':[{'index':0,'embedding':[0.1,0.2]}],'usage':{'prompt_tokens':99,'total_tokens':99}}
     monkeypatch.setattr(providers.litellm, 'aembedding', fake_sdk)
@@ -3195,7 +3066,6 @@ def test_embedding_callback_absent_never_trusts_synthetic_usage(context, monkeyp
     assert response.status_code == 200 and 'usage' not in response.json()
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['input_tokens'] is None and record['estimated_cost'] is None
-    assert len(client.get('/admin/budget-reservations', headers=admin()).json()) == 1
 
 
 def test_embedding_usage_capture_is_request_scoped(monkeypatch):
@@ -3233,7 +3103,6 @@ def test_openai_embedding_usage_provenance_with_base64_format(context, monkeypat
     client, _ = context
     _, model_id, key = configure(client, ['embedding'])
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -3250,7 +3119,6 @@ def test_openai_embedding_usage_provenance_with_base64_format(context, monkeypat
     assert response.json()['data'][0]['embedding'] == 'zczMPc3MTD4='
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
     assert record['input_tokens'] == 0 and float(record['estimated_cost']) == 0
-    assert not client.get('/admin/budget-reservations', headers=admin()).json()
 
 
 @pytest.mark.parametrize('batch', [False, True])
@@ -3274,7 +3142,6 @@ def test_gemini_embedding_native_usage_without_network(context, monkeypatch, bat
     model = client.post('/admin/models', headers=admin(), json={'alias':'gemini-embed','provider_id':conn['id'],'upstream_model':'gemini-embedding-001','operations':['embedding']}).json()
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model['id']]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-    assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin(), json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
     def no_network(*args, **kwargs): raise AssertionError('Unexpected network access')
     monkeypatch.setattr(socket.socket, 'connect', no_network)
     monkeypatch.setattr(socket, 'getaddrinfo', no_network)
@@ -3298,13 +3165,11 @@ def test_gemini_embedding_native_usage_without_network(context, monkeypatch, bat
     requests = json.loads(observed[0][1]['data'])['requests']
     assert len(requests) == (2 if batch else 1) and all(item['outputDimensionality'] == 2 for item in requests)
     record = client.get('/admin/usage/requests', headers=admin()).json()[0]
-    budget = client.get('/admin/budgets', headers=admin()).json()[0]
     if expected is None:
         assert 'usage' not in response.json() and record['input_tokens'] is None and record['estimated_cost'] is None
-        assert Decimal(budget['held_amount']) == Decimal('0.1')
     else:
         assert response.json()['usage'] == {'prompt_tokens':expected} and record['input_tokens'] == expected
-        assert Decimal(record['estimated_cost']) == Decimal(expected) * Decimal('0.01') and Decimal(budget['held_amount']) == 0
+        assert Decimal(record['estimated_cost']) == Decimal(expected) * Decimal('0.01')
 
 
 @pytest.mark.parametrize(('upstream','expected'), [(400,400),(429,429),(503,503),(500,502),(200,502),('timeout',504)])

@@ -119,7 +119,6 @@ def test_native_provider_roundtrip(monkeypatch, provider, model, operation, resp
             issued = client.post('/admin/api-keys', headers=admin, json={'name':'test','model_ids':[registered['id']]}).json()
             key = issued['key']
             assert client.post('/admin/prices', headers=admin, json={'model_id':registered['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0' if operation == 'embedding' else '10000'}).status_code == 201
-            assert client.put(f"/admin/api-keys/{issued['id']}/budget", headers=admin, json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
             path = '/v1/chat/completions' if operation == 'generation' else '/v1/embeddings'
             payload = {'model':'native','messages':[{'role':'user','content':'hello'}], 'max_tokens':32} if operation == 'generation' else {'model':'native','input':'hello'}
             tool_response = provider == 'anthropic' and response_body['content'][0]['type'] == 'tool_use'
@@ -166,11 +165,9 @@ def test_native_provider_roundtrip(monkeypatch, provider, model, operation, resp
                 assert usage['input_tokens'] == expected_input and usage['output_tokens'] == expected_output
                 if expected_output is None or expected_input is None:
                     assert usage['estimated_cost'] is None
-                    assert len(client.get('/admin/budget-reservations', headers=admin).json()) == 1
             else:
                 assert usage['input_tokens'] is None and usage['total_tokens'] is None
                 assert usage['estimated_cost'] is None
-                assert len(client.get('/admin/budget-reservations', headers=admin).json()) == 1
             assert 'mock-secret' not in str(usage)
     finally:
         app.dependency_overrides.clear()
@@ -268,7 +265,6 @@ def test_native_provider_stream_roundtrip_without_network(monkeypatch, provider,
             issued = client.post('/admin/api-keys', headers=admin, json={'name':'test','model_ids':[registered['id']]}).json()
             key = issued['key']
             assert client.post('/admin/prices', headers=admin, json={'model_id':registered['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
-            assert client.put(f"/admin/api-keys/{issued['id']}/budget", headers=admin, json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
             payload = {'model':'native-stream','messages':[{'role':'user','content':'hello'}], 'max_tokens':32, 'stream':True}
             if include_usage:
                 payload['stream_options'] = {'include_usage':True}
@@ -285,18 +281,14 @@ def test_native_provider_stream_roundtrip_without_network(monkeypatch, provider,
             assert usage['status'] == ('success' if should_succeed else 'error') and 'mock-secret' not in str(usage)
             if not should_succeed:
                 assert usage['estimated_cost'] is None
-                assert len(client.get('/admin/budget-reservations', headers=admin).json()) == 1
             elif missing_output:
                 assert usage['output_tokens'] is None and usage['estimated_cost'] is None
-                assert len(client.get('/admin/budget-reservations', headers=admin).json()) == 1
             elif provider == 'gemini' and '"candidatesTokenCount":0' in wire:
                 assert usage['input_tokens'] == 0 and usage['output_tokens'] == 0
                 assert float(usage['estimated_cost']) == 0
-                assert not client.get('/admin/budget-reservations', headers=admin).json()
             else:
                 assert usage['input_tokens'] == 7 and usage['output_tokens'] == 3
                 assert float(usage['estimated_cost']) == 0.1
-                assert not client.get('/admin/budget-reservations', headers=admin).json()
     finally:
         app.dependency_overrides.clear()
         engine.dispose()

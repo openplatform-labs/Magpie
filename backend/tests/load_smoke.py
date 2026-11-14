@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app import providers
 from app.main import app, db_session
-from app.models import KeyBudget, UsageRecord
+from app.models import UsageRecord
 
 # Fail closed if an accidentally missing provider mock attempts a network call.
 # psycopg resolves only the configured database host and libpq connects itself.
@@ -70,7 +70,6 @@ try:
         model = client.post('/admin/models', headers=admin, json={'alias':'embed','provider_id':provider['id'],'upstream_model':'fake','operations':['embedding']}).json()
         key = client.post('/admin/api-keys', headers=admin, json={'name':'load','model_ids':[model['id']]}).json()
         assert client.post('/admin/prices', headers=admin, json={'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-        assert client.put(f"/admin/api-keys/{key['id']}/budget", headers=admin, json={'currency':'USD','limit_amount':'10000','reserve_per_request':'0.05'}).status_code == 200
         limited = client.post('/admin/api-keys', headers=admin, json={'name':'limited','model_ids':[model['id']],'requests_per_minute':10}).json()
         first_data = {'alias':'embed','provider_id':provider['id'],'upstream_model':'fake','operations':['embedding'], 'embedding_space':'load-space','embedding_dimensions':2}
         assert client.put('/admin/models/'+str(model['id']), headers=admin, json=first_data).status_code == 200
@@ -78,7 +77,6 @@ try:
         assert client.post('/admin/prices', headers=admin, json={'model_id':backup['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
         assert client.post('/admin/routes', headers=admin, json={'alias':'retry-load','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':model['id'],'priority':0},{'model_id':backup['id'],'priority':1}]}).status_code == 201
         retry_key = client.post('/admin/api-keys', headers=admin, json={'name':'retry-load','model_ids':[model['id'],backup['id']]}).json()
-        assert client.put(f"/admin/api-keys/{retry_key['id']}/budget", headers=admin, json={'currency':'USD','limit_amount':'100','reserve_per_request':'0.05'}).status_code == 200
 
     async def run_batch(token, size, concurrency, alias='embed'):
         semaphore = asyncio.Semaphore(concurrency)
@@ -133,9 +131,8 @@ try:
     assert statuses.count(200) == 10 and statuses.count(429) == 20, statuses
 
     with Session(test_engine) as session:
-        budget = session.get(KeyBudget, key['id'])
-        assert budget.spent_amount == Decimal('0.02') * total and budget.held_amount == 0
         assert session.scalar(select(func.count()).select_from(UsageRecord).where(UsageRecord.client_key_id == key['id'], UsageRecord.status == 'success')) == total
+        assert session.scalar(select(func.sum(UsageRecord.estimated_cost)).where(UsageRecord.client_key_id == key['id'])) == Decimal('0.02') * total
         assert session.scalar(select(func.count()).select_from(UsageRecord).where(UsageRecord.client_key_id == limited['id'])) == 10
     assert len(calls) == total + 10
     async def flaky_embedding(config, data):
@@ -151,18 +148,15 @@ try:
         roots = {record.root_request_id for record in records}
         failures = sum(record.status == 'error' for record in records)
         successes = sum(record.status == 'success' for record in records)
-        budget = session.get(KeyBudget, retry_key['id'])
         assert len(roots) == 24 and successes == 24 and failures >= 1
         assert len(records) == successes + failures and max(record.attempt_number for record in records) == 2
-        assert budget.held_amount == Decimal('0.05') * failures and budget.spent_amount == Decimal('0.02') * successes
+        assert sum((record.estimated_cost or Decimal('0')) for record in records) == Decimal('0.02') * successes
     print(f'retry concurrency=12 requests=24 failures={failures} attempts={len(records)} elapsed_s={elapsed:.3f}')
     # PostgreSQL INTEGER is bounded even though Python integers are not.
-    # A malformed provider usage record must not roll back request finalization
-    # or release its reserve as if the provider reported a reliable charge.
+    # Malformed provider usage must not roll back request finalization or be
+    # treated as a reliable cost.
     with TestClient(app) as client:
         invalid_key = client.post('/admin/api-keys', headers=admin, json={'name':'invalid-usage','model_ids':[model['id']]}).json()
-        assert client.put(f"/admin/api-keys/{invalid_key['id']}/budget", headers=admin,
-                          json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.05'}).status_code == 200
     async def malformed_usage(config, data):
         return {'model':'mock','data':[{'index':0,'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2147483648}}
     providers.embedding = malformed_usage
@@ -170,11 +164,9 @@ try:
     assert invalid_results[0][0] == 200
     with Session(test_engine) as session:
         record = session.get(UsageRecord, invalid_results[0][2])
-        budget = session.get(KeyBudget, invalid_key['id'])
         assert record.status == 'success' and record.input_tokens is None and record.estimated_cost is None
-        assert budget.held_amount == Decimal('0.05') and budget.spent_amount == 0
-    print('PostgreSQL safely retained the reservation for out-of-range provider usage')
-    print(f'passed: {total} budgeted requests and 30 rate-limited attempts; no provider network calls')
+    print('PostgreSQL safely recorded unknown out-of-range provider usage')
+    print(f'passed: {total} requests and 30 rate-limited attempts; no provider network calls')
 finally:
     providers.embedding = original_embedding
     app.dependency_overrides.clear()

@@ -30,7 +30,6 @@ if mode == 'setup':
     assert request('POST', '/admin/prices', admin, {'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'})[0] == 201
     status, key = request('POST', '/admin/api-keys', admin, {'name':'db-test','model_ids':[model['id']],'requests_per_minute':100})
     assert status == 201
-    assert request('PUT', f"/admin/api-keys/{key['id']}/budget", admin, {'currency':'USD','limit_amount':'10','reserve_per_request':'0.05'})[0] == 200
     state_file.write_text(key['key'])
     state_file.chmod(0o600)
     assert request('POST','/v1/embeddings',key['key'],{'model':'embed','input':'sample'})[0] == 200
@@ -50,33 +49,21 @@ elif mode == 'recovered':
     assert request('GET', '/health/ready')[0] == 200
     key = state_file.read_text()
     assert request('POST','/v1/embeddings',key,{'model':'embed','input':'sample'})[0] == 200
-    status, budgets = request('GET','/admin/budgets',admin)
-    assert status == 200 and Decimal(budgets[0]['spent_amount']) == Decimal('0.04') and Decimal(budgets[0]['held_amount']) == Decimal('0.05')
     status, records = request('GET','/admin/usage/requests',admin)
     assert status == 200 and len(records) == 3 and sorted(r['status'] for r in records) == ['started','success','success']
-    status, pending = request('GET','/admin/budget-reservations',admin)
-    assert status == 200 and len(pending) == 1 and pending[0]['request_status'] == 'started'
-    request_id = pending[0]['request_id']
+    request_id = next(row['request_id'] for row in records if row['status'] == 'started')
     assert request('POST',f'/admin/usage/requests/{request_id}/resolve',admin,{'note':'mock worker completed during DB outage'})[0] == 200
-    assert request('POST',f'/admin/budget-reservations/{request_id}/reconcile',admin,{'settled_amount':'0.02','note':'mock invoice'})[0] == 409
-    assert request('POST',f'/admin/budget-reservations/{request_id}/reconcile',admin,{'settled_amount':'0.02','note':'mock invoice','force_started':True})[0] == 200
-    status, budgets = request('GET','/admin/budgets',admin)
-    assert status == 200 and Decimal(budgets[0]['spent_amount']) == Decimal('0.06') and Decimal(budgets[0]['held_amount']) == 0
     status, records = request('GET','/admin/usage/requests?status=unknown',admin)
     assert status == 200 and len(records) == 1 and records[0]['resolution_note'] == 'mock worker completed during DB outage'
     status, audit = request('GET','/admin/audit',admin)
     assert status == 200 and any(row['action'] == 'usage.resolve_unknown' for row in audit)
-    print('DB recovered: requests resumed; interrupted accounting retained its reservation')
+    print('DB recovered: requests resumed; interrupted usage remains available for review')
 elif mode == 'crash_recovered':
     key = state_file.read_text()
     assert request('POST','/v1/embeddings',key,{'model':'embed','input':'sample'})[0] == 200
-    status, budgets = request('GET','/admin/budgets',admin)
-    assert status == 200 and Decimal(budgets[0]['spent_amount']) == Decimal('0.08') and Decimal(budgets[0]['held_amount']) == Decimal('0.05')
     status, records = request('GET','/admin/usage/requests',admin)
     assert status == 200 and len(records) == 5 and sorted(r['status'] for r in records) == ['started','success','success','success','unknown']
-    status, pending = request('GET','/admin/budget-reservations',admin)
-    assert status == 200 and len(pending) == 1 and pending[0]['request_status'] == 'started'
-    print('Worker crash: request was not replayed; its unknown outcome and reservation were retained')
+    print('Worker crash: request was not replayed; its unknown outcome was retained')
 elif mode == 'slow_proxy':
     key = state_file.read_text()
     assert request('POST','/v1/embeddings',key,{'model':'embed','input':'hold-for-proxy-test'},timeout=90)[0] == 200

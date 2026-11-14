@@ -25,8 +25,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from .database import engine
 from .request_limit import BodyLimitMiddleware
-from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetAdjustment, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OperationalPolicy, ModelCircuit, ModelRoute, RouteTarget, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
-from . import budgets, circuits, observability, providers, rate_limit
+from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OperationalPolicy, ModelCircuit, ModelRoute, RouteTarget, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
+from . import circuits, observability, providers, rate_limit
 from .security import cipher, decrypt_secret, encrypt_secret, hash_key, new_client_key, password_hash, password_verify, valid_bootstrap_token
 
 app = FastAPI(title="Magpie", version="0.2.0")
@@ -289,12 +289,6 @@ class RouteIn(StrictModel):
     retry_on_failure: bool = False
 
 
-class BudgetIn(StrictModel):
-    currency: str = Field(pattern=r"^[A-Z]{3}$")
-    limit_amount: Decimal = Field(ge=0, max_digits=24, decimal_places=10)
-    reserve_per_request: Decimal = Field(gt=0, max_digits=24, decimal_places=10)
-
-
 class RetentionIn(StrictModel):
     usage_days: int = Field(ge=1, le=36500)
     audit_days: int = Field(ge=1, le=36500)
@@ -308,19 +302,6 @@ class OperationalPolicyIn(StrictModel):
     size_warning_bytes: int | None = Field(default=None, ge=1, le=9000000000000000)
     stale_after_minutes: int = Field(default=60, ge=1, le=525600)
     stale_count_warning: int = Field(default=1, ge=1, le=1000000000)
-
-
-class ReconcileIn(StrictModel):
-    settled_amount: Decimal = Field(ge=0, max_digits=24, decimal_places=10)
-    note: str = Field(min_length=1, max_length=500)
-    force_started: bool = False
-
-
-class AdjustmentIn(StrictModel):
-    id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,36}$")
-    expected_amount: Decimal = Field(ge=0, max_digits=24, decimal_places=10)
-    revised_amount: Decimal = Field(ge=0, max_digits=24, decimal_places=10)
-    note: str = Field(min_length=1, max_length=500)
 
 
 class PriceIn(StrictModel):
@@ -596,6 +577,10 @@ def client_auth(db: DB, authorization: str | None = Header(default=None)) -> Cli
     key = db.scalar(select(ClientKey).where(ClientKey.key_hash == hash_key(raw), ClientKey.active.is_(True), or_(ClientKey.expires_at.is_(None), ClientKey.expires_at > func.now())))
     if not key:
         raise HTTPException(401, "Invalid API key", headers={"WWW-Authenticate": "Bearer"})
+    # Never silently remove an existing spending limit. The operator must
+    # replace legacy budget-bound keys after reviewing their retained ledger.
+    if db.get(KeyBudget, key.id) is not None:
+        raise HTTPException(403, "Legacy budget-bound key must be replaced")
     return key
 
 
@@ -1370,7 +1355,8 @@ def create_key(body: KeyIn, db: DB, _: Admin,
 @app.get("/admin/api-keys")
 def list_keys(db: DB, _: Admin):
     rows = db.scalars(select(ClientKey).options(selectinload(ClientKey.grants)).order_by(ClientKey.id)).all()
-    return [{"id": k.id, "name": k.name, "prefix": k.key_prefix, "active": k.active, "expires_at": k.expires_at, "requests_per_minute": k.requests_per_minute, "model_ids": [g.model_id for g in k.grants]} for k in rows]
+    legacy_budget_ids = set(db.scalars(select(KeyBudget.client_key_id)).all())
+    return [{"id": k.id, "name": k.name, "prefix": k.key_prefix, "active": k.active, "expires_at": k.expires_at, "requests_per_minute": k.requests_per_minute, "model_ids": [g.model_id for g in k.grants], "legacy_budget": k.id in legacy_budget_ids} for k in rows]
 
 
 @app.delete("/admin/api-keys/{key_id}", status_code=204)
@@ -1429,122 +1415,6 @@ def set_provider_active(provider_id: int, body: ActiveIn, db: DB, _: Admin):
     observability.audit(db, "provider.activate" if body.active else "provider.deactivate", "provider", row.id, actor=_)
     commit(db)
     return {"id": row.id, "active": row.active}
-
-
-@app.put("/admin/api-keys/{key_id}/budget")
-def set_budget(key_id: int, body: BudgetIn, db: DB, actor: Admin):
-    key = db.scalar(select(ClientKey).where(ClientKey.id == key_id).with_for_update())
-    if key is None or not key.active:
-        raise HTTPException(404, "Active API key not found")
-    budget = db.scalar(select(KeyBudget).where(KeyBudget.client_key_id == key_id).with_for_update())
-    if budget is None:
-        budget = KeyBudget(client_key_id=key_id, currency=body.currency, limit_amount=body.limit_amount,
-                           reserve_per_request=body.reserve_per_request, spent_amount=Decimal(0), held_amount=Decimal(0))
-        db.add(budget)
-    else:
-        if budget.currency != body.currency:
-            raise HTTPException(409, "Budget currency cannot be changed")
-        budget.limit_amount, budget.reserve_per_request = body.limit_amount, body.reserve_per_request
-    observability.audit(db, "budget.set", "api_key", key_id, actor=actor)
-    commit(db)
-    return {"client_key_id": key_id, "currency": budget.currency, "limit_amount": str(budget.limit_amount),
-            "reserve_per_request": str(budget.reserve_per_request), "spent_amount": str(budget.spent_amount),
-            "held_amount": str(budget.held_amount)}
-
-
-@app.get("/admin/budgets")
-def list_budgets(db: DB, _: Admin):
-    return [{"client_key_id": b.client_key_id, "currency": b.currency, "limit_amount": str(b.limit_amount),
-             "reserve_per_request": str(b.reserve_per_request), "spent_amount": str(b.spent_amount),
-             "held_amount": str(b.held_amount)} for b in db.scalars(select(KeyBudget).order_by(KeyBudget.client_key_id))]
-
-
-@app.get("/admin/budget-reservations")
-def list_budget_reservations(db: DB, _: Admin, limit: int = Query(default=100, ge=1, le=500),
-                             before_started_at: datetime | None = None,
-                             before_request_id: str | None = Query(default=None, min_length=1, max_length=36)):
-    query = (select(BudgetReservation, UsageRecord, KeyBudget.currency, ModelPrice)
-             .join(UsageRecord, UsageRecord.request_id == BudgetReservation.request_id)
-             .join(KeyBudget, KeyBudget.client_key_id == BudgetReservation.client_key_id)
-             .outerjoin(ModelPrice, ModelPrice.id == UsageRecord.price_id)
-             .where(BudgetReservation.status == "pending"))
-    query = before_usage_cursor(query, before_started_at, before_request_id)
-    rows = db.execute(query.order_by(UsageRecord.started_at.desc(), UsageRecord.request_id.desc()).limit(limit)).all()
-    def pending_details(usage, price):
-        missing_input = bool(price and price.basis == 'tokens' and price.input_per_million and usage.input_tokens is None)
-        missing_output = bool(price and price.basis == 'tokens' and price.output_per_million and usage.output_tokens is None)
-        reason = {'started':'in_progress_or_unfinished', 'unknown':'result_unknown', 'error':'request_failed',
-                  'interrupted':'request_interrupted'}.get(usage.status)
-        if reason is None:
-            reason = 'usage_unavailable' if usage.status == 'success' and (missing_input or missing_output) else 'settlement_unresolved'
-        return {'pending_reason': reason, 'missing_input_tokens': missing_input, 'missing_output_tokens': missing_output}
-    return [{"request_id": r.request_id, "client_key_id": r.client_key_id, "reserved_amount": str(r.reserved_amount),
-             "currency": currency, "model_id": u.model_id, "requested_alias": u.requested_alias,
-             "provider_id_snapshot": u.provider_id_snapshot, "provider_type_snapshot": u.provider_type_snapshot,
-             "provider_name_snapshot": u.provider_name_snapshot, "upstream_model_snapshot": u.upstream_model_snapshot,
-             "root_request_id": u.root_request_id or u.request_id, "attempt_number": u.attempt_number,
-             "request_status": u.status, "operation": u.operation, "started_at": u.started_at,
-             "finished_at": u.finished_at, **pending_details(u, price)} for r, u, currency, price in rows]
-
-
-@app.post("/admin/budget-reservations/{request_id}/reconcile")
-def reconcile_budget(request_id: str, body: ReconcileIn, db: DB, actor: Admin):
-    reservation = db.get(BudgetReservation, request_id)
-    # Completion and manual resolution also lock usage before the budget and
-    # reservation. Wait for them and decide from the committed current status.
-    usage = db.scalar(select(UsageRecord).where(UsageRecord.request_id == request_id)
-                      .with_for_update().execution_options(populate_existing=True))
-    if reservation is None or usage is None:
-        raise HTTPException(404, "Reservation not found")
-    if usage.status in ("started", "unknown") and not body.force_started:
-        raise HTTPException(409, "Request may still be running; explicit force is required")
-    if not budgets.settle(db, reservation, body.settled_amount, "manual", body.note, actor, body.force_started):
-        raise HTTPException(409, "Reservation was already settled")
-    observability.audit(db, "budget.reconcile_forced" if body.force_started else "budget.reconcile", "request", request_id, actor=actor)
-    commit(db)
-    return {"request_id": request_id, "settled_amount": str(body.settled_amount), "status": "manual"}
-
-
-@app.get("/admin/budget-reservations/{request_id}/adjustments")
-def budget_adjustments(request_id: str, db: DB, _: Admin):
-    reservation = db.get(BudgetReservation, request_id)
-    if reservation is None:
-        raise HTTPException(404, "Reservation not found")
-    rows = db.scalars(select(BudgetAdjustment).where(BudgetAdjustment.request_id == request_id).order_by(BudgetAdjustment.created_at, BudgetAdjustment.id))
-    return {"request_id": request_id, "status": reservation.status,
-            "settled_amount": str(reservation.settled_amount) if reservation.settled_amount is not None else None,
-            "reconciled_at": reservation.reconciled_at,
-            "reconciliation_note": reservation.reconciliation_note,
-            "reconciliation_actor": reservation.reconciliation_actor,
-            "reconciliation_forced": reservation.reconciliation_forced,
-            "adjustments": [{"id": a.id, "previous_amount": str(a.previous_amount), "revised_amount": str(a.revised_amount),
-                             "note": a.note, "actor": a.actor, "created_at": a.created_at} for a in rows]}
-
-
-@app.post("/admin/budget-reservations/{request_id}/adjustments")
-def adjust_budget(request_id: str, body: AdjustmentIn, db: DB, actor: Admin):
-    reservation = db.get(BudgetReservation, request_id)
-    if reservation is None:
-        raise HTTPException(404, "Reservation not found")
-    # Match the settlement lock order; serialize retries and concurrent adjustments.
-    budget = db.scalar(select(KeyBudget).where(KeyBudget.client_key_id == reservation.client_key_id).with_for_update().execution_options(populate_existing=True))
-    reservation = db.scalar(select(BudgetReservation).where(BudgetReservation.request_id == request_id).with_for_update().execution_options(populate_existing=True))
-    existing = db.get(BudgetAdjustment, body.id)
-    if existing:
-        if (existing.request_id, existing.previous_amount, existing.revised_amount, existing.note) != (request_id, body.expected_amount, body.revised_amount, body.note):
-            raise HTTPException(409, "Adjustment ID already used with different details")
-        return {"id": existing.id, "request_id": request_id, "revised_amount": str(existing.revised_amount)}
-    if reservation.status == "pending" or reservation.settled_amount is None:
-        raise HTTPException(409, "Reservation must be settled first")
-    if reservation.settled_amount != body.expected_amount:
-        raise HTTPException(409, "Settled amount changed; refresh before adjusting")
-    budget.spent_amount += body.revised_amount - reservation.settled_amount
-    reservation.settled_amount = body.revised_amount
-    db.add(BudgetAdjustment(id=body.id, request_id=request_id, previous_amount=body.expected_amount,
-                            revised_amount=body.revised_amount, note=body.note, actor=actor, created_at=datetime.now(timezone.utc)))
-    observability.audit(db, "budget.adjust", "request", request_id, actor=actor)
-    commit(db)
-    return {"id": body.id, "request_id": request_id, "revised_amount": str(body.revised_amount)}
 
 
 @app.get("/v1/models")
@@ -1777,14 +1647,12 @@ def operational_status(db: DB, _: Admin):
     now = db.scalar(select(func.now()))
     cutoff = now - timedelta(minutes=age_minutes)
     stale = db.scalar(select(func.count()).select_from(UsageRecord).where(UsageRecord.status == 'started', UsageRecord.started_at < cutoff))
-    pending = db.scalar(select(func.count()).select_from(BudgetReservation).join(UsageRecord, UsageRecord.request_id == BudgetReservation.request_id)
-                        .where(BudgetReservation.status == 'pending', UsageRecord.started_at < cutoff))
     size = db.scalar(select(func.pg_database_size(func.current_database()))) if db.get_bind().dialect.name == 'postgresql' else None
     return {'database_size_bytes': size, 'size_warning_bytes': threshold,
             'size_warning': None if size is None or threshold is None else size >= threshold,
             'stale_after_minutes': age_minutes, 'stale_count_warning': warning_count,
-            'stale_started_requests': stale, 'stale_pending_reservations': pending,
-            'stale_warning': max(stale, pending) >= warning_count, 'checked_at': now}
+            'stale_started_requests': stale,
+            'stale_warning': stale >= warning_count, 'checked_at': now}
 
 
 async def db_work(work):
@@ -1850,22 +1718,22 @@ async def invoke(body, operation, db, key, fn, decision_images_enabled=False):
         bind = db.get_bind()
         circuit = (model_id, operation, verification_version)
         tried.add(model_id)
-        def reserve_attempt():
+        def record_attempt():
             if attempt == 1:
                 rate_limit.consume(db, key)
             return observability.begin(db, key_id, model_id, operation,
                 len(body.questions) if operation == "decision" else None, pricing_version, body.model, root_request_id, attempt, model_snapshot)
-        pending_reservation = asyncio.create_task(asyncio.to_thread(reserve_attempt))
+        pending_record = asyncio.create_task(asyncio.to_thread(record_attempt))
         try:
             # These synchronous transactions can wait for database row locks.
             # Keep that wait off the ASGI event loop so unrelated requests and
             # ongoing provider streams can continue.
-            request_id, started = await asyncio.shield(pending_reservation)
+            request_id, started = await asyncio.shield(pending_record)
         except asyncio.CancelledError:
             # A worker thread cannot be cancelled while it is committing.
-            # Wait for it and finalize any committed reservation as interrupted.
+            # Wait for it and finalize any committed request record as interrupted.
             try:
-                cancelled_id, cancelled_started = await pending_reservation
+                cancelled_id, cancelled_started = await pending_record
             except Exception:
                 db.rollback()
             else:

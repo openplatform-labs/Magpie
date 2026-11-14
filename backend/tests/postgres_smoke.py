@@ -21,13 +21,13 @@ from starlette.requests import Request
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
-from app.main import AdjustmentIn, CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, adjust_budget, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
+from app.main import CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
 from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, OIDCIdentity, OIDCTransaction, RouteTarget, UsageRecord
 from app.rate_limit import consume
 from app.database import runtime_engine
 from app.recover_admin import recover
 from app.rotate_key import rotate
-from app import budgets, circuits, observability, providers
+from app import circuits, observability, providers
 
 # Permit psycopg's database-host DNS lookup and libpq's connections, while
 # blocking Python HTTP clients if a provider mock is accidentally omitted.
@@ -331,7 +331,6 @@ try:
         assert client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+exa_key}, json={'model':'chat-mock','messages':[{'role':'user','content':'ordinary text'}]}).status_code == 200
         assert client.post('/admin/prices', headers=auth, json={'model_id':exa_model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'1'}).status_code == 201
         stream_key = client.post('/admin/api-keys', headers=auth, json={'name':'truncated-stream','model_ids':[exa_model]}).json()
-        assert client.put(f"/admin/api-keys/{stream_key['id']}/budget", headers=auth, json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.1'}).status_code == 200
         async def incomplete_stream(config, data):
             async def chunks():
                 yield {'choices':[{'index':0,'delta':{'content':'partial'},'finish_reason':None}]}
@@ -341,8 +340,6 @@ try:
         assert truncated.status_code == 200 and 'Provider stream failed' in truncated.text and '[DONE]' not in truncated.text
         record = client.get('/admin/usage/requests', headers=auth, params={'root_request_id':truncated.headers['x-request-id']}).json()[0]
         assert record['status'] == 'error' and record['estimated_cost'] is None
-        reservation = next(r for r in client.get('/admin/budget-reservations', headers=auth).json() if r['request_id'] == record['request_id'])
-        assert Decimal(reservation['reserved_amount']) == Decimal('0.1') and reservation['pending_reason'] == 'request_failed'
         providers.completion = fake_chat
         assert client.put('/admin/models/'+str(exa_model), headers=auth, json={'alias':'chat-mock','provider_id':exa_provider,'upstream_model':'mock','operations':['generation'],'supports_tools':False}).status_code == 200
         chat_backup = client.post('/admin/models', headers=auth, json={'alias':'chat-backup','provider_id':exa_provider,'upstream_model':'backup','operations':['generation'],'supports_tools':True}).json()['id']
@@ -477,13 +474,7 @@ try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             race = list(pool.map(alias_race, ['model','route']))
         assert sorted(race) == [201, 409], race
-        budget_response = client.put('/admin/api-keys/'+str(key_id)+'/budget', headers=auth,
-            json={'currency':'USD','limit_amount':'0.10','reserve_per_request':'0.02'})
-        assert budget_response.status_code == 200
-        # A locked budget must not hold a request indefinitely or dispatch a
-        # provider call before the reservation transaction commits.
         lock_key = client.post('/admin/api-keys', headers=auth, json={'name':'lock-test','model_ids':[model_id]}).json()
-        assert client.put(f"/admin/api-keys/{lock_key['id']}/budget", headers=auth, json={'currency':'USD','limit_amount':'1','reserve_per_request':'0.02'}).status_code == 200
         bounded_engine = runtime_engine(test_url, lock_timeout_ms=2000, statement_timeout_ms=5000)
         def get_bounded_db():
             with Session(bounded_engine) as session:
@@ -515,36 +506,6 @@ try:
                 finally:
                     holder.rollback()
                 assert waiting.result(timeout=5).status_code == 200
-            with Session(test_engine) as holder:
-                holder.scalar(select(KeyBudget).where(KeyBudget.client_key_id == lock_key['id']).with_for_update())
-                started = time.monotonic()
-                locked_response = client.post('/v1/decisions', headers={'Authorization':'Bearer '+lock_key['key']}, json=payload)
-                assert locked_response.status_code == 503 and time.monotonic() - started < 3
-                assert dispatched_lock == [True]
-                with Session(test_engine) as check:
-                    records = check.scalars(select(UsageRecord).where(UsageRecord.client_key_id == lock_key['id'])).all()
-                    assert len(records) == 1 and records[0].status == 'success'
-                holder.rollback()
-            with Session(test_engine) as holder, ThreadPoolExecutor(max_workers=1) as pool:
-                holder.scalar(select(KeyBudget).where(KeyBudget.client_key_id == lock_key['id']).with_for_update())
-                waiting = pool.submit(client.post, '/v1/decisions', headers={'Authorization':'Bearer '+lock_key['key']}, json=payload)
-                try:
-                    deadline = time.monotonic() + 1.5
-                    while time.monotonic() < deadline:
-                        with test_engine.connect() as connection:
-                            blocked = connection.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%key_budgets%'"))
-                        if blocked:
-                            break
-                        time.sleep(0.02)
-                    assert blocked, 'request did not reach the budget lock'
-                    before = time.monotonic()
-                    assert client.get('/health/live').status_code == 200
-                    assert time.monotonic() - before < 1, 'lock wait blocked the event loop'
-                finally:
-                    holder.rollback()
-                assert waiting.result(timeout=5).status_code == 200
-            assert client.post('/v1/decisions', headers={'Authorization':'Bearer '+lock_key['key']}, json=payload).status_code == 200
-            assert dispatched_lock == [True, True, True]
             provider_entered, provider_release = threading.Event(), threading.Event()
             async def delayed_result(config, data):
                 provider_entered.set()
@@ -613,95 +574,28 @@ try:
             finally:
                 release.set()
                 providers.decision = original_decision
-        def reserve_attempt(_):
-            with Session(test_engine) as session:
-                try:
-                    request_id, _started = observability.begin(session, key_id, model_id, 'decision', 1, 1)
-                    return request_id
-                except HTTPException as error:
-                    assert error.status_code == 429
-                    return None
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            reservations = list(pool.map(reserve_attempt, range(12)))
-        accepted = [r for r in reservations if r]
-        assert len(accepted) == 5, reservations
+        # Historical budget rows remain protected from retention; no new budget is created.
         with Session(test_engine) as session:
-            for request_id in accepted:
-                session.execute(text("UPDATE usage_records SET started_at = '2099-01-01T00:00:00Z' WHERE request_id = :request_id"), {'request_id':request_id})
+            old = datetime.now(timezone.utc) - timedelta(days=60)
+            session.add(KeyBudget(client_key_id=key_id, currency='USD', limit_amount=Decimal('1'),
+                                  reserve_per_request=Decimal('.1'), spent_amount=Decimal('0'), held_amount=Decimal('.1')))
+            session.add(UsageRecord(request_id='legacy-budget-record', client_key_id=key_id, model_id=model_id,
+                                    operation='decision', status='success', started_at=old, finished_at=old))
+            session.flush()
+            session.add(BudgetReservation(request_id='legacy-budget-record', client_key_id=key_id,
+                                          reserved_amount=Decimal('.1'), status='pending'))
+            session.add(UsageRecord(request_id='old-no-reservation', client_key_id=key_id, model_id=model_id,
+                                    operation='decision', status='success', started_at=old, finished_at=old))
             session.commit()
-        for path, extra in [('/admin/usage/requests', {'key_id':key_id}), ('/admin/budget-reservations', {})]:
-            cursor = dict(extra, limit=2)
-            paged = []
-            for _ in range(3):
-                page = client.get(path, headers=auth, params=cursor)
-                assert page.status_code == 200, page.text
-                items = page.json()
-                assert items
-                paged.extend(item['request_id'] for item in items)
-                cursor.update(before_started_at=items[-1]['started_at'], before_request_id=items[-1]['request_id'])
-            assert paged[:5] == sorted(accepted, reverse=True)
-        def reconcile_once(_):
-            with Session(test_engine) as session:
-                existing = session.get(BudgetReservation, accepted[0])
-                result = budgets.settle(session, existing, Decimal('0.01'), 'manual', 'concurrent test', 'admin:1', True)
-                session.commit()
-                return result
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            reconciled = list(pool.map(reconcile_once, range(2)))
-        assert sorted(reconciled) == [False, True], reconciled
-        history = client.get('/admin/budget-reservations/'+accepted[0]+'/adjustments', headers=auth).json()
-        assert history['reconciliation_note'] == 'concurrent test' and history['reconciliation_actor'] == 'admin:1' and history['reconciled_at'] is not None
-        assert history['reconciliation_forced'] is True
-        def adjust_once(number):
-            with Session(test_engine) as session:
-                try:
-                    adjust_budget(accepted[0], AdjustmentIn(id='adjust-'+str(number), expected_amount=Decimal('0.01'),
-                        revised_amount=Decimal('0.03'), note='invoice'), session, 'admin:1')
-                    return 200
-                except HTTPException as error:
-                    session.rollback()
-                    return error.status_code
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            adjusted = list(pool.map(adjust_once, range(2)))
-        assert sorted(adjusted) == [200, 409], adjusted
-        with Session(test_engine) as session:
-            budget = session.get(KeyBudget, key_id)
-            assert budget.spent_amount == Decimal('0.03') and budget.held_amount == Decimal('0.08')
-        # A completion can hold the usage row while deciding its final status.
-        # Reconciliation must wait, then use that committed status instead of
-        # rejecting based on the pre-completion "started" snapshot.
-        with Session(test_engine) as holder, ThreadPoolExecutor(max_workers=1) as pool:
-            row = holder.scalar(select(UsageRecord).where(UsageRecord.request_id == accepted[1]).with_for_update())
-            assert row.status == 'started'
-            row.status = 'error'
-            row.finished_at = datetime.now(timezone.utc)
-            holder.flush()
-            pending = pool.submit(client.post, '/admin/budget-reservations/'+accepted[1]+'/reconcile',
-                headers=auth, json={'settled_amount':'0.01','note':'provider receipt','force_started':False})
-            try:
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    with test_engine.connect() as connection:
-                        blocked = connection.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%usage_records%'"))
-                    if blocked: break
-                    time.sleep(0.02)
-                assert blocked, 'manual reconciliation did not wait for usage finalization'
-            finally:
-                holder.commit()
-            result = pending.result(timeout=5)
-            assert result.status_code == 200, result.text
-        record = client.get('/admin/budget-reservations/'+accepted[1]+'/adjustments', headers=auth).json()
-        assert record['status'] == 'manual' and record['reconciliation_forced'] is False
-        with Session(test_engine) as session:
-            session.execute(text("UPDATE usage_records SET finished_at = now() - interval '60 days' WHERE request_id = :request_id"), {'request_id': accepted[0]})
-            session.execute(text("INSERT INTO usage_records (request_id, client_key_id, model_id, operation, status, started_at, finished_at) VALUES ('old-no-reservation', :key, :model, 'decision', 'success', now() - interval '60 days', now() - interval '60 days')"), {'key': key_id, 'model': model_id})
-            session.commit()
-        preview = client.post('/admin/retention/preview', headers=auth, json={'usage_days': 30, 'audit_days': 30})
+        assert client.get('/v1/models', headers={'Authorization':'Bearer '+raw}).status_code == 403
+        assert next(item for item in client.get('/admin/api-keys', headers=auth).json() if item['id'] == key_id)['legacy_budget'] is True
+        preview = client.post('/admin/retention/preview', headers=auth, json={'usage_days':30, 'audit_days':30})
         assert preview.status_code == 200 and preview.json()['usage_records'] == 1, preview.text
-        applied = client.post('/admin/retention/apply', headers=auth, json={'usage_days': 30, 'audit_days': 30})
+        applied = client.post('/admin/retention/apply', headers=auth, json={'usage_days':30, 'audit_days':30})
         assert applied.status_code == 200 and applied.json()['usage_records_deleted'] == 1, applied.text
         with Session(test_engine) as session:
-            assert session.get(UsageRecord, accepted[0]) is not None
+            assert session.get(UsageRecord, 'legacy-budget-record') is not None
+            assert session.get(BudgetReservation, 'legacy-budget-record') is not None
             assert session.get(UsageRecord, 'old-no-reservation') is None
         with Session(test_engine) as session:
             assert recover(session, user['username'], 'recovered test password') == 1
@@ -841,7 +735,7 @@ try:
             assert len(active) == 1 and active[0].id in (1, race_user)
             sessions = session.scalars(select(AdminSession).where(AdminSession.token_hash.in_([f'{1:064x}', f'{2:064x}']))).all()
             assert len(sessions) == 2 and all(item.revoked == (item.user_id != active[0].id) for item in sessions)
-    print('PostgreSQL migrations, accounts, mocked Jev, pricing, audit, limits, budgets, routing and retention passed')
+    print('PostgreSQL migrations, accounts, mocked Jev, pricing, audit, limits, legacy budget retention, routing and retention passed')
 finally:
     app.dependency_overrides.clear()
     test_engine.dispose()

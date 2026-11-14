@@ -49,7 +49,6 @@ for operation in ('generation','embedding'):
     assert status == 201
 status, key = request_json('POST','/admin/api-keys',body={'name':'stall-test','model_ids':[model['id'],embed_model['id']]})
 assert status == 201
-assert request_json('PUT',f"/admin/api-keys/{key['id']}/budget",body={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'})[0] == 200
 
 started = time.monotonic()
 status, result = request_json('POST','/v1/embeddings',key['key'],{'model':'mock-embed','input':'hold-for-db-test'})
@@ -61,8 +60,5 @@ status, response = request_json('POST','/v1/chat/completions',key['key'],{'model
 assert status == 200 and response['choices'][0]['message']['content'] == 'mock complete'
 status, records = request_json('GET','/admin/usage/requests')
 assert status == 200 and sorted(row['status'] for row in records) == ['error','error','success']
-status, budgets = request_json('GET','/admin/budgets')
-assert status == 200 and Decimal(budgets[0]['held_amount']) == Decimal('0.2') and Decimal(budgets[0]['spent_amount']) == Decimal('0.03')
-status, pending = request_json('GET','/admin/budget-reservations')
-assert status == 200 and len(pending) == 2 and all(row['request_status'] == 'error' for row in pending)
-print('Mock provider stalls timed out through HA proxy; reservations held and subsequent request succeeded.')
+assert sum(Decimal(row['estimated_cost']) for row in records if row['estimated_cost'] is not None) == Decimal('0.03')
+print('Mock provider stalls timed out through HA proxy; usage records retained and subsequent request succeeded.')

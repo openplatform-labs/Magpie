@@ -68,7 +68,7 @@ done
 printf '%s\n' 'No new provider calls started while PostgreSQL was unavailable.'
 
 # Kill only the test worker handling an in-flight request. Nginx must not
-# replay that request to the other worker; the committed reservation remains.
+# replay that request to the other worker; the committed usage record remains.
 python3 backend/tests/db_failure_client.py crash_inflight "$test_dir/key" > "$test_dir/crash.log" 2>&1 &
 inflight_pid=$!
 crashed_id=''

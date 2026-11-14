@@ -8,8 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from .models import AuditLog, BudgetReservation, ModelPrice, UsageRecord
-from . import budgets
+from .models import AuditLog, ModelPrice, UsageRecord
 from .providers import as_dict, apply_generation_usage, UPSTREAM_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -30,9 +29,7 @@ def begin(db, key_id, model_id, operation, question_count=None, pricing_version=
         operation=operation, requested_alias=requested_alias, status='started', started_at=started_at, question_count=question_count,
         **(model_snapshot or {})))
     db.flush()
-    if key_id is not None:
-        budgets.reserve(db, key_id, request_id, price)
-    db.commit()  # Reservation and request record commit before the provider call.
+    db.commit()  # The request record commits before the provider call.
     return request_id, time.monotonic()
 
 
@@ -78,9 +75,6 @@ def end(bind, request_id, started, status, usage=None):
                 if cost is not None:
                     cost = cost.quantize(Decimal("0.0000000001"), rounding=ROUND_CEILING)
                     row.estimated_cost, row.currency = cost, price.currency
-                    reservation = db.get(BudgetReservation, request_id)
-                    if reservation is not None:
-                        budgets.settle(db, reservation, cost, 'settled')
             db.commit()
     except Exception:
         # The provider call may already have been billed; do not retry it.

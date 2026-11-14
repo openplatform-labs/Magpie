@@ -41,7 +41,6 @@ assert status == 201
 assert request('POST', '/admin/prices', admin, {'model_id':model['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'})[0] == 201
 status, key = request('POST', '/admin/api-keys', admin, {'name':'ha','model_ids':[model['id']],'requests_per_minute':1000})
 assert status == 201
-assert request('PUT', f"/admin/api-keys/{key['id']}/budget", admin, {'currency':'USD','limit_amount':'100','reserve_per_request':'0.05'})[0] == 200
 
 
 def send(_):
@@ -51,32 +50,11 @@ def send(_):
 with ThreadPoolExecutor(max_workers=16) as pool:
     statuses = list(pool.map(send, range(64)))
 assert statuses == [200] * 64, statuses
-status, budgets = request('GET', '/admin/budgets', admin)
-assert status == 200 and Decimal(budgets[0]['spent_amount']) == Decimal('1.28') and Decimal(budgets[0]['held_amount']) == 0
 status, records = request('GET', '/admin/usage/requests?limit=100', admin)
 assert status == 200 and len(records) == 64 and all(r['status'] == 'success' for r in records)
 assert len({r['request_id'] for r in records}) == 64
-print('64 concurrent mocked requests passed through the HA proxy; PostgreSQL usage and budget totals agree')
-
-# Hold accepted provider calls open so concurrent reservations compete for the
-# same budget across both backend processes before any request can settle.
-status, constrained = request('POST', '/admin/api-keys', admin, {'name':'budget-race','model_ids':[model['id']],'requests_per_minute':1000})
-assert status == 201
-assert request('PUT', f"/admin/api-keys/{constrained['id']}/budget", admin,
-               {'currency':'USD','limit_amount':'0.10','reserve_per_request':'0.05'})[0] == 200
-def budget_race(_):
-    return request('POST', '/v1/embeddings', constrained['key'], {'model':'embed','input':'hold-for-db-test'})[0]
-
-with ThreadPoolExecutor(max_workers=16) as pool:
-    statuses = list(pool.map(budget_race, range(16)))
-assert statuses.count(200) == 2 and statuses.count(429) == 14, statuses
-status, budgets = request('GET', '/admin/budgets', admin)
-budget = next(item for item in budgets if item['client_key_id'] == constrained['id'])
-assert status == 200 and Decimal(budget['spent_amount']) == Decimal('0.04') and Decimal(budget['held_amount']) == 0
-status, records = request('GET', '/admin/usage/requests?limit=100', admin)
-budget_records = [row for row in records if row['client_key_id'] == constrained['id']]
-assert status == 200 and len(budget_records) == 2 and all(row['status'] == 'success' for row in budget_records)
-print('Concurrent budget reservations admitted exactly two of sixteen requests across the HA proxy')
+assert sum(Decimal(r['estimated_cost']) for r in records) == Decimal('1.28')
+print('64 concurrent mocked requests passed through the HA proxy; PostgreSQL usage and cost totals agree')
 
 # All requests arrive in one short burst; retry if the test is started just
 # before a UTC minute boundary, rather than asserting a false global limit.
@@ -112,8 +90,6 @@ for operation, registered in [('generation', chat), ('decision', judge)]:
     status, issued = request('POST', '/admin/api-keys', admin, {'name':operation+'-ha','model_ids':[registered['id']],
                               'requests_per_minute':1000})
     assert status == 201
-    assert request('PUT', f"/admin/api-keys/{issued['id']}/budget", admin,
-                   {'currency':'USD','limit_amount':'10','reserve_per_request':'0.05'})[0] == 200
     endpoint, body = (('/v1/chat/completions', {'model':'chat-ha','messages':[{'role':'user','content':'test'}]})
                       if operation == 'generation' else ('/v1/decisions', {'model':'judge-ha','input':'test',
                         'questions':[{'type':'predicate','name':'q','instructions':'yes?'}]}))
@@ -128,11 +104,8 @@ for operation, registered in [('generation', chat), ('decision', judge)]:
     assert summary['operation'] == operation and summary['requests'] == 24
     assert summary['input_tokens'] == 48 and summary['output_tokens'] == 24
     assert Decimal(summary['estimated_cost']) == Decimal('0.72')
-    status, budgets = request('GET', '/admin/budgets', admin)
-    budget = next(item for item in budgets if item['client_key_id'] == issued['id'])
-    assert status == 200 and Decimal(budget['spent_amount']) == Decimal('0.72') and Decimal(budget['held_amount']) == 0
     if operation == 'decision': assert summary['question_count'] == 24
-    print(f'24 concurrent mocked {operation} requests passed; usage and budgets agree')
+    print(f'24 concurrent mocked {operation} requests passed; usage and costs agree')
 
 soak_seconds = int(os.environ.get('MAGPIE_HA_SOAK_SECONDS', '0'))
 if not 0 <= soak_seconds <= 3600:
@@ -141,8 +114,6 @@ if soak_seconds:
     status, soak_key = request('POST', '/admin/api-keys', admin,
                                {'name':'ha-soak','model_ids':[model['id']],'requests_per_minute':100000})
     assert status == 201
-    assert request('PUT', f"/admin/api-keys/{soak_key['id']}/budget", admin,
-                   {'currency':'USD','limit_amount':'10000','reserve_per_request':'0.05'})[0] == 200
     deadline = time.monotonic() + soak_seconds
     def soak_worker(_):
         count = 0
@@ -156,16 +127,13 @@ if soak_seconds:
         counts = list(pool.map(soak_worker, range(4)))
     total = sum(counts)
     assert min(counts) > 0
-    status, budgets = request('GET', '/admin/budgets', admin)
-    budget = next(item for item in budgets if item['client_key_id'] == soak_key['id'])
-    assert status == 200 and Decimal(budget['spent_amount']) == Decimal('0.02') * total and Decimal(budget['held_amount']) == 0
     status, summaries = request('GET', f"/admin/usage?key_id={soak_key['id']}", admin)
     assert status == 200 and len(summaries) == 1
     summary = summaries[0]
     assert summary['status'] == 'success' and summary['requests'] == total
     assert summary['input_tokens'] == 2 * total and summary['cost_records'] == total
     assert Decimal(summary['estimated_cost']) == Decimal('0.02') * total
-    print(f'HA soak workers=4 seconds={soak_seconds} requests={total}; usage and budgets agree')
+    print(f'HA soak workers=4 seconds={soak_seconds} requests={total}; usage and costs agree')
 
 # The bootstrap credential is retired when the first admin is created, so this
 # test must run after the workload that uses it.
