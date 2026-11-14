@@ -23,3 +23,15 @@ assert.equal(component.drawer, null); assert.equal(refreshes, 1);
 component.editProviderName(provider); component.saveProviderName(); component.logout();
 requests[2].result.next({id:1,name:'EXAONE'}); assert.equal(refreshes, 1);
 console.log('Provider name edits handle duplicate submissions, conflicts and stale sessions.');
+
+async function timeoutReleasesNameDrawer(): Promise<void> {
+  (component as any).managementTimeoutMs = 10;
+  component.editProviderName(provider); component.editProviderNameDraft = '시간 초과';
+  component.saveProviderName();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(component.providerNameSaving, false);
+  assert(component.error.includes('변경 결과를 확인하지 못했습니다'));
+  component.closeDrawer(); assert.equal(component.drawer, null);
+  console.log('Timed-out provider name changes release the drawer and report an uncertain outcome.');
+}
+timeoutReleasesNameDrawer().catch(error => { console.error(error); process.exitCode = 1; });
