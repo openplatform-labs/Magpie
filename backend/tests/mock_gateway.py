@@ -3,7 +3,7 @@ import asyncio
 import os
 import socket
 from app.main import app
-from app import providers, oidc
+from app import main, providers, oidc
 
 # Provider mocks must never fall through to a Python network client. PostgreSQL
 # connects through libpq; the server itself only accepts incoming sockets.
@@ -39,6 +39,18 @@ async def mock_embedding(config, data):
 
 
 providers.embedding = mock_embedding
+
+
+# Keep provider data out of the logs while identifying a response validation
+# failure if the isolated concurrent test unexpectedly returns 502.
+_validate_embedding_response = main.validate_embedding_response
+def mock_validate_embedding_response(data, request, dimensions):
+    try:
+        return _validate_embedding_response(data, request, dimensions)
+    except Exception as error:
+        print('MOCK_EMBEDDING_VALIDATION_FAILED', type(error).__name__, flush=True)
+        raise
+main.validate_embedding_response = mock_validate_embedding_response
 
 
 async def mock_completion(config, data):
