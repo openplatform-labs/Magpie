@@ -33,6 +33,7 @@ Cerebras와 Novita는 각각 공식 [Cerebras 모델 목록 API](https://inferen
 
 - `POST /admin/users`, `POST /admin/sessions`, `DELETE /admin/sessions/current`: 계정 생성과 로그인·로그아웃
 - `POST /admin/providers`, `PUT /admin/providers/{id}/key`: 공급자 등록·키 교체
+- `PUT /admin/providers/{id}/model-group`: 모델 용도에 맞게 공급자 그룹 변경
 - `POST /admin/providers/{id}/discover`: 공급자 모델 목록 조회 (관리자의 명시적 요청 시 외부 연결)
 - `POST /admin/models`, `PUT /admin/models/{id}`: 모델 별칭, 작업 유형 및 기능 메타데이터 관리
 - `POST /admin/api-keys`, `DELETE /admin/api-keys/{id}`: 클라이언트 키 발급·폐기

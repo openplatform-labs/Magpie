@@ -3633,3 +3633,28 @@ def test_provider_groups_enforce_model_purpose_without_network(context):
     for alias in ('embed', 'jev'):
         response = client.post('/v1/chat/completions', headers=auth, json={'model':alias, 'messages':[{'role':'user', 'content':'test'}]})
         assert response.status_code == 403
+
+
+def test_provider_group_change_preserves_models_and_rejects_conflicts(context):
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'purpose','provider_type':'openai','model_group':'general'}).json()['id']
+    def model(alias, operation):
+        return client.post('/admin/models', headers=admin(), json={'alias':alias, 'provider_id':provider, 'upstream_model':alias, 'operations':[operation]}).json()['id']
+    embedding = model('embed-group-test', 'embedding')
+    generation = model('chat-group-test', 'generation')
+    endpoint = f'/admin/providers/{provider}/model-group'
+    assert client.put(endpoint, json={'model_group':'embedding'}).status_code == 401
+    assert client.put(endpoint, headers=admin(), json={'model_group':'embedding'}).status_code == 409
+    assert client.put(f'/admin/models/{generation}/active', headers=admin(), json={'active':False}).status_code == 200
+    assert client.put(endpoint, headers=admin(), json={'model_group':'embedding'}).status_code == 409
+    assert client.get('/admin/providers', headers=admin()).json()[0]['model_group'] == 'general'
+    second = client.post('/admin/providers', headers=admin(), json={'name':'general-two','provider_type':'openai','model_group':'general'}).json()['id']
+    assert client.put(f'/admin/models/{generation}', headers=admin(), json={'alias':'chat-group-test','provider_id':second,'upstream_model':'chat-group-test','operations':['generation']}).status_code == 200
+    assert client.put(endpoint, headers=admin(), json={'model_group':'embedding'}).status_code == 200
+    assert client.get('/admin/providers', headers=admin()).json()[0]['model_group'] == 'embedding'
+    assert client.post('/admin/models', headers=admin(), json={'alias':'rejected-chat','provider_id':provider,'upstream_model':'chat','operations':['generation']}).status_code == 422
+    assert client.get('/admin/models', headers=admin()).json()[0]['id'] in (generation, embedding)
+    assert any(row['action'] == 'provider.group.change' for row in client.get('/admin/audit', headers=admin()).json())
+    assert client.put(endpoint, headers=admin(), json={'model_group':'general'}).status_code == 200
+    jev = client.post('/admin/providers', headers=admin(), json={'name':'jev-group','provider_type':'typesafe'}).json()['id']
+    assert client.put(f'/admin/providers/{jev}/model-group', headers=admin(), json={'model_group':'general'}).status_code == 422

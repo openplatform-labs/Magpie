@@ -205,6 +205,12 @@ class OIDCCallbackIn(BaseModel):
     code: str = Field(min_length=1, max_length=4096, repr=False)
 
 
+def valid_provider_group(provider_type: str, model_group: str) -> bool:
+    return not ((provider_type == 'typesafe' and model_group != 'decision') or
+                (model_group == 'decision' and provider_type not in ('typesafe', 'openai')) or
+                (provider_type in providers.CODING_PROVIDERS and model_group != 'general'))
+
+
 class ProviderIn(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     provider_type: str = Field(min_length=1, max_length=50)
@@ -216,12 +222,8 @@ class ProviderIn(StrictModel):
             raise ValueError("Unsupported provider")
         if self.model_group is None:
             self.model_group = 'decision' if self.provider_type == 'typesafe' else 'general'
-        if self.provider_type == 'typesafe' and self.model_group != 'decision':
-            raise ValueError('TypeSafe connections require the decision group')
-        if self.model_group == 'decision' and self.provider_type not in ('typesafe', 'openai'):
-            raise ValueError('Decision connections require TypeSafe or OpenAI')
-        if self.provider_type in providers.CODING_PROVIDERS and self.model_group != 'general':
-            raise ValueError('Coding plan connections require the general group')
+        if not valid_provider_group(self.provider_type, self.model_group):
+            raise ValueError('The provider does not support this group')
         return self
     api_key: str | None = Field(default=None, min_length=1, max_length=4096, repr=False)
     base_url: str | None = Field(default=None, max_length=500)
@@ -237,6 +239,10 @@ class ProviderIn(StrictModel):
 
 class SecretIn(StrictModel):
     api_key: str = Field(min_length=1, max_length=4096, repr=False)
+
+
+class ProviderGroupIn(StrictModel):
+    model_group: Literal['general', 'decision', 'embedding']
 
 
 class ModelIn(StrictModel):
@@ -1113,6 +1119,29 @@ def create_provider(body: ProviderIn, db: DB, _: Admin):
     observability.audit(db, "provider.create", "provider", p.id, actor=_)
     commit(db)
     return {"id": p.id, "name": p.name, "provider_type": p.provider_type, "model_group": p.model_group, "configured": bool(p.encrypted_api_key)}
+
+
+@app.put('/admin/providers/{provider_id}/model-group')
+def set_provider_model_group(provider_id: int, body: ProviderGroupIn, db: DB, actor: Admin):
+    # Serialize with model creation and updates so a concurrent write cannot
+    # leave a dedicated connection with an incompatible model.
+    lock_catalog(db)
+    p = db.get(ProviderConnection, provider_id)
+    if not p:
+        raise HTTPException(404, 'Provider not found')
+    if not valid_provider_group(p.provider_type, body.model_group):
+        raise HTTPException(422, 'The provider does not support this group')
+    if p.model_group == body.model_group:
+        return {'id': p.id, 'model_group': p.model_group}
+    if body.model_group != 'general':
+        incompatible = db.scalar(select(ModelCapability.id).join(ModelRegistration).where(
+            ModelRegistration.provider_id == provider_id, ModelCapability.operation != body.model_group).limit(1))
+        if incompatible:
+            raise HTTPException(409, 'Move incompatible models to another connection first')
+    p.model_group = body.model_group
+    observability.audit(db, 'provider.group.change', 'provider', p.id, actor=actor)
+    commit(db)
+    return {'id': p.id, 'model_group': p.model_group}
 
 
 def change_provider_key(provider_id: int, secret: str | None, db: Session, actor: str):
