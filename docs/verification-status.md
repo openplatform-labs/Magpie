@@ -5,7 +5,7 @@
 | 설계 요구사항 | 현재 근거 | 남은 확인 |
 | --- | --- | --- |
 | PostgreSQL 19, Redis 미사용 | Compose의 PostgreSQL 19 RC2, Alembic 마이그레이션, `tests/postgres_smoke.py`; 격리된 PostgreSQL 18.7 백업을 19 RC2에 복구하고 테스트 데이터 검증 | PostgreSQL 19 정식 버전 출시 후 이미지와 업그레이드 경로 재검증 |
-| Angular 22·Clarity 18 관리 화면 | 컨테이너 빌드와 세션·키 시험, Docker 미리보기에서 로그인·메뉴 전환·모델 및 키 양식 확인 | 개편된 화면의 모바일·스크린 리더 및 전체 등록 흐름 검증 |
+| Angular 22·Clarity 18 관리 화면 | 컨테이너 빌드와 세션·키 시험; 격리된 Docker UI에서 최초 관리자 생성, 공급자 무키 등록, EXAONE 생성·임베딩 및 Jev 판단 모델 등록, 테스트 키 발급·권한 편집 화면과 감사 조회 확인 | 개편된 화면의 모바일·스크린 리더 검증 |
 | 생성·임베딩·판단 API와 EXAONE·TypeSafe | `/v1` 엔드포인트와 `tests/test_api.py`, `tests/test_native_provider_contracts.py`의 모의 전송 | 실제 공급자·모델별 기능과 장애 응답은 미검증 |
 | MCP·A2A 제외, 함수 호출 전달 | 생성 입력 검증 및 공급자 관리 도구 거부 시험 | 새 공급자 어댑터나 API 기능 추가 시 같은 경계 재검증 |
 | 공급자 키와 클라이언트 권한 | 키 암호화, 클라이언트 키 해시·일회 표시, PostgreSQL 키 폐기·비활성화 경합 시험 | 실제 배포의 키 관리, 네트워크 egress 및 접근 통제 검토 |
