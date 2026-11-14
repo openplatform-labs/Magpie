@@ -56,6 +56,7 @@ jobs:
       - run: npm ci
       - run: npm audit --audit-level=low
       - run: node tests/run-session-test.cjs
+      - run: TZ=America/New_York node tests/run-session-test.cjs
       - run: npm run build
       - run: python3 tests/check_csp.py
 
