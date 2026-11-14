@@ -194,9 +194,9 @@ export class AppComponent implements OnInit {
   editProviderGroup(provider: Connection): void { if (this.groupSaving) return; this.groupEditVersion++; this.groupEditing = provider; this.groupDraft = provider.model_group; this.groupError = ''; this.groupSaving = false; this.openDrawer('group'); }
   saveProviderGroup(): void {
     const provider = this.groupEditing; if (!provider || this.groupSaving) return;
-    const version = this.groupEditVersion; const group = this.groupDraft; this.groupSaving = true; this.groupError = '';
+    const version = this.groupEditVersion; const group = this.groupDraft; this.refreshSelectedDiscovery(provider.id); this.groupSaving = true; this.groupError = '';
     this.http.put('/admin/providers/' + provider.id + '/model-group', {model_group:group}, {headers:this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
-      next: () => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.closeDrawer(); this.message = '공급자 그룹을 변경했습니다.'; this.login();}); },
+      next: () => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.connections = this.connections.map(item => item.id === provider.id ? {...item, model_group:group} : item); this.refreshSelectedDiscovery(provider.id, {model_group:group}); this.closeDrawer(); this.message = '공급자 그룹을 변경했습니다.'; this.login();}); },
       error: failure => { if (version !== this.groupEditVersion) return; this.update(() => {this.groupSaving = false; this.groupError = failure?.status === 409 ? '이 그룹과 다른 용도의 모델이 있습니다. 해당 모델을 먼저 다른 공급자 연결로 이동하세요.' : this.uncertainSave(failure) ? '변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 화면을 새로고침해 공급자 그룹을 확인하세요.' : '그룹을 변경하지 못했습니다. 공급자와 그룹을 확인하세요.';}); }
     });
   }
