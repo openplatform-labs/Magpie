@@ -1,0 +1,28 @@
+import '@angular/compiler';
+import { strict as assert } from 'node:assert';
+import { ChangeDetectorRef, Injector, runInInjectionContext } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Subject } from 'rxjs';
+import { AppComponent } from '../src/app/app.component';
+import { SessionLifecycle } from '../src/app/session-lifecycle';
+
+const requests: {url:string; body:any; result:Subject<any>}[] = [];
+const http = {post: (url:string, body:any) => {const result = new Subject<any>(); requests.push({url, body, result}); return result.asObservable();}};
+const injector = Injector.create({providers:[SessionLifecycle, {provide:HttpClient, useValue:http}, {provide:ChangeDetectorRef, useValue:{markForCheck(){}}}]});
+const component = runInInjectionContext(injector, () => new AppComponent());
+component.refreshObservability = () => {};
+const model = {id:1, alias:'model', active:true, operations:['embedding']} as any;
+component.selectModelTest(model);
+assert.equal(requests.length, 0);
+component.runModelTest(); component.runModelTest();
+assert.equal(requests.length, 1);
+assert.equal(requests[0].url, '/admin/models/1/test');
+assert.deepEqual(requests[0].body, {operation:'embedding'});
+requests[0].result.next({request_id:'mock-id'});
+assert(component.testMessage.includes('mock-id') && !component.testLoading);
+component.runModelTest(); requests[1].result.error({status:504});
+assert(component.testError.includes('시간') && !component.testLoading);
+component.runModelTest(); component.logout(); requests[2].result.next({request_id:'stale'});
+assert.equal(component.testModel, null);
+assert.equal(component.testMessage, '');
+console.log('Explicit model tests suppress duplicates, report timeouts, and ignore stale responses.');

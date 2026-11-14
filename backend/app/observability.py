@@ -30,7 +30,8 @@ def begin(db, key_id, model_id, operation, question_count=None, pricing_version=
         operation=operation, requested_alias=requested_alias, status='started', started_at=started_at, question_count=question_count,
         **(model_snapshot or {})))
     db.flush()
-    budgets.reserve(db, key_id, request_id, price)
+    if key_id is not None:
+        budgets.reserve(db, key_id, request_id, price)
     db.commit()  # Reservation and request record commit before the provider call.
     return request_id, time.monotonic()
 

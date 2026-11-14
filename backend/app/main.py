@@ -1999,6 +1999,81 @@ async def invoke(body, operation, db, key, fn, decision_images_enabled=False):
     raise last_error
 
 
+class ModelTestIn(StrictModel):
+    operation: Literal['generation', 'embedding', 'decision']
+
+
+@app.post('/admin/models/{model_id}/test')
+async def test_registered_model(model_id: int, body: ModelTestIn, db: DB, actor: Admin):
+    """Execute one small, explicitly requested provider call without a client key."""
+    operation = body.operation
+    def prepare():
+        row = db.scalar(select(ModelRegistration).where(ModelRegistration.id == model_id)
+                        .options(selectinload(ModelRegistration.capabilities), selectinload(ModelRegistration.provider)))
+        if not row or not row.active or not row.provider.active:
+            raise HTTPException(404, 'Active model not found')
+        if operation not in {cap.operation for cap in row.capabilities}:
+            raise HTTPException(422, 'Model does not support this operation')
+        config = upstream_config(row)
+        if operation == 'generation':
+            request = ChatIn(model=row.alias, messages=[{'role':'user', 'content':'Reply with OK.'}], max_tokens=16)
+        elif operation == 'embedding':
+            request = EmbeddingIn(model=row.alias, input='Magpie connection test')
+            if error := embedding_limit_error(row, request):
+                raise HTTPException(400, error)
+        else:
+            request = DecisionIn(model=row.alias, input='The sky is blue.', questions=[{'type':'predicate','name':'test','instructions':'Is the statement about the sky?'}])
+        snapshot = {'provider_id_snapshot':row.provider.id, 'provider_type_snapshot':row.provider.provider_type,
+                    'provider_name_snapshot':row.provider.name, 'upstream_model_snapshot':row.upstream_model}
+        observability.audit(db, 'model.test', 'model', row.id, actor=actor)
+        request_id, started = observability.begin(db, None, row.id, operation,
+            1 if operation == 'decision' else None, row.pricing_version, row.alias, model_snapshot=snapshot)
+        return request, config, row.embedding_dimensions, snapshot, request_id, started
+    # A cancellation cannot abandon a DB worker that might already commit.
+    pending = asyncio.create_task(asyncio.to_thread(prepare))
+    try:
+        request, config, dimensions, snapshot, request_id, started = await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        try:
+            _, _, _, _, request_id, started = await pending
+        except Exception:
+            pass
+        else:
+            await observability.finish(db.get_bind(), request_id, started, 'interrupted')
+        raise
+    bind = db.get_bind()
+    try:
+        fn = {'generation':providers.completion, 'embedding':providers.embedding, 'decision':providers.decision}[operation]
+        async with asyncio.timeout(providers.UPSTREAM_TIMEOUT_SECONDS):
+            result = await fn(config, request.model_dump(exclude={'model'}, exclude_none=True))
+        data = providers.as_dict(result)
+        if not isinstance(data, dict):
+            raise ValueError('Invalid provider response')
+        if operation == 'generation':
+            validate_generation_response(data)
+            providers.apply_generation_usage(data, result, snapshot['provider_type_snapshot'])
+        elif operation == 'embedding':
+            validate_embedding_response(data, request, dimensions)
+            providers.apply_embedding_usage(data, result)
+            if snapshot['provider_type_snapshot'] == 'gemini' and not isinstance(result, providers.EmbeddingProvenance):
+                data.pop('usage', None)
+        else:
+            validate_decision_response(data, request)
+            providers.apply_decision_usage(data, result)
+    except asyncio.CancelledError:
+        await observability.finish(bind, request_id, started, 'interrupted')
+        raise
+    except Exception as exc:
+        await observability.finish(bind, request_id, started, 'error')
+        if isinstance(exc, (TimeoutError, providers.litellm.Timeout)) or getattr(exc, 'status_code', None) in (408, 504):
+            raise HTTPException(504, 'Provider test timed out', headers={'X-Request-ID':request_id}) from None
+        raise HTTPException(502, 'Provider test failed', headers={'X-Request-ID':request_id}) from None
+    # Once the provider response has been validated, cancellation during the
+    # shielded success finalization must not overwrite the success as interrupted.
+    await observability.finish(bind, request_id, started, 'success', data.get('usage'))
+    return {'request_id':request_id, 'operation':operation, 'status':'success'}
+
+
 @app.post("/v1/chat/completions")
 async def chat(body: ChatIn, db: DB, key: Client):
     return await invoke(body, "generation", db, key, providers.completion)

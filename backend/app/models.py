@@ -97,7 +97,7 @@ class UsageRecord(Base):
     request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     root_request_id: Mapped[str | None] = mapped_column(String(36))
     attempt_number: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
-    client_key_id: Mapped[int] = mapped_column(ForeignKey("client_keys.id"))
+    client_key_id: Mapped[int | None] = mapped_column(ForeignKey("client_keys.id"))
     model_id: Mapped[int] = mapped_column(ForeignKey("model_registrations.id"))
     operation: Mapped[str] = mapped_column(String(30))
     requested_alias: Mapped[str | None] = mapped_column(String(100))

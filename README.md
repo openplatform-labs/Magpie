@@ -10,6 +10,8 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 
 공급자 등록 후 ‘연결 테스트 및 모델 불러오기’를 누르면 저장된 키로 공급자의 모델 목록 API를 조회합니다. 목록에서 모델을 선택해 생성형, 판단형 또는 임베딩 작업을 지정하고 등록할 수 있습니다. 목록 조회만으로 추론 권한이나 모델별 기능이 보장되지는 않습니다. 목록 API를 제공하지 않거나 지원되지 않는 공급자는 모델 ID를 직접 입력하세요. EXAONE 모델 목록 경로는 OpenAI 호환 경로를 사용하지만 실제 서비스와의 호환성은 검증하지 않았습니다. 조회는 버튼을 누를 때만 실행되며 테스트에는 모의 응답을 사용합니다.
 
+모델 등록 후 모델 화면의 ‘호출 테스트’에서 명시적으로 실행하면 짧은 생성·임베딩·판단 요청을 공급자에 한 번 보냅니다. 실제 호출이므로 과금될 수 있으며 클라이언트 키 예산은 적용되지 않습니다. 관리자의 테스트 요청은 사용량과 감사 이력에 별도로 표시하며, 공급자 응답 본문과 키는 저장하지 않습니다. 호출이 실패하거나 시간 초과되어도 공급자가 처리했을 수 있습니다. 개발 테스트는 모의 공급자로만 진행합니다.
+
 Gemini 목록에서 공급자가 `generateContent` 또는 `embedContent`를 명시하면 해당 용도를 표시합니다. 이 표시는 목록 응답의 참고 정보이며, 등록자가 실제 사용할 용도를 직접 선택합니다. 다른 공급자나 메서드 정보가 없는 모델의 용도는 추측하지 않습니다.
 
 Cerebras와 Novita는 각각 공식 [Cerebras 모델 목록 API](https://inference-docs.cerebras.ai/api-reference/models/list-models)와 [Novita 모델 목록 API](https://docs.novita.ai/api-reference/model-apis-llm-list-models)를 사용합니다. Fireworks는 [계정별 모델 목록 API](https://docs.fireworks.ai/api-reference/list-models)에서 공개 `fireworks` 계정만 조회하므로 개인 계정 모델은 직접 등록해야 합니다. 이 공급자들의 실제 목록·추론 호출은 테스트하지 않았습니다.
@@ -37,6 +39,7 @@ Cerebras와 Novita는 각각 공식 [Cerebras 모델 목록 API](https://inferen
 - `POST /admin/providers`, `PUT /admin/providers/{id}/key`: 공급자 등록·키 교체
 - `PUT /admin/providers/{id}/model-group`: 모델 용도에 맞게 공급자 그룹 변경
 - `POST /admin/providers/{id}/discover`: 공급자 모델 목록 조회 (관리자의 명시적 요청 시 외부 연결)
+- `POST /admin/models/{id}/test`: 등록된 모델의 지정 작업을 실제 공급자에 한 번 테스트 (관리자 요청, 과금 가능)
 - `POST /admin/models`, `PUT /admin/models/{id}`: 모델 별칭, 작업 유형 및 기능 메타데이터 관리
 - `POST /admin/api-keys`, `DELETE /admin/api-keys/{id}`: 클라이언트 키 발급·폐기
 - `GET /v1/models`: 키에 허용된 모델 목록

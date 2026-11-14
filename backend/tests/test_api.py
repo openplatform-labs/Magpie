@@ -3681,3 +3681,77 @@ def test_gemini_discovery_surfaces_only_explicit_supported_methods(context, monk
     assert results['embed']['advertised_operations'] == ['embedding']
     assert results['both']['advertised_operations'] == ['generation', 'embedding']
     assert all('advertised_operations' not in results[name] for name in ('unknown','invalid','absent'))
+
+
+@pytest.mark.parametrize('operation', ['generation', 'embedding', 'decision'])
+def test_admin_model_test_is_audited_and_uses_mock_provider(context, monkeypatch, operation):
+    client, _ = context
+    kind = 'typesafe' if operation == 'decision' else 'exaone'
+    provider = client.post('/admin/providers', headers=admin(), json={'name':operation,'provider_type':kind,'api_key':'synthetic-secret'}).json()['id']
+    model = client.post('/admin/models', headers=admin(), json={'alias':'test-model','provider_id':provider,'upstream_model':'mock-model','operations':[operation]}).json()['id']
+    calls = []
+    async def fake(config, data):
+        calls.append((config, data))
+        if operation == 'generation':
+            return {'choices':[{'index':0,'message':{'role':'assistant','content':'OK'},'finish_reason':'stop'}], 'usage':{'prompt_tokens':2,'completion_tokens':1}}
+        if operation == 'embedding':
+            return {'data':[{'index':0,'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2}}
+        return {'answers':[{'type':'predicate','name':'test','probability':0.9}], 'usage':{'input_tokens':2,'output_tokens':1}}
+    monkeypatch.setattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation], fake)
+    url = f'/admin/models/{model}/test'
+    assert client.post(url, json={'operation':operation}).status_code == 401
+    assert client.post(url, headers=admin(), json={'operation':operation,'extra':'bad'}).status_code == 422
+    response = client.post(url, headers=admin(), json={'operation':operation})
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'success' and len(calls) == 1
+    assert 'synthetic-secret' not in response.text and 'OK' not in response.text
+    usage = client.get('/admin/usage/requests', headers=admin()).json()
+    assert len(usage) == 1 and usage[0]['request_id'] == response.json()['request_id']
+    assert usage[0]['client_key_id'] is None and usage[0]['status'] == 'success'
+    assert usage[0]['input_tokens'] == 2
+    aggregate = client.get('/admin/usage', headers=admin()).json()
+    assert len(aggregate) == 1 and aggregate[0]['client_key_id'] is None and aggregate[0]['requests'] == 1
+    assert client.get('/admin/metrics', headers=admin()).json()['unique_requests'] == 1
+    assert any(row['action'] == 'model.test' for row in client.get('/admin/audit', headers=admin()).json())
+    assert client.post(url, headers=admin(), json={'operation':'embedding' if operation != 'embedding' else 'generation'}).status_code == 422
+    assert len(calls) == 1
+
+
+def test_admin_model_test_sanitizes_provider_failure(context, monkeypatch):
+    client, _ = context
+    provider, model, _ = configure(client, ['generation'])
+    async def failure(config, data): raise RuntimeError('sensitive-upstream-secret')
+    monkeypatch.setattr(providers, 'completion', failure)
+    response = client.post(f'/admin/models/{model}/test', headers=admin(), json={'operation':'generation'})
+    assert response.status_code == 502 and 'sensitive-upstream-secret' not in response.text
+    row = client.get('/admin/usage/requests', headers=admin()).json()[0]
+    assert row['status'] == 'error' and row['client_key_id'] is None
+
+
+def test_admin_model_test_requires_active_model_and_key(context, monkeypatch):
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'no-key','provider_type':'exaone'}).json()['id']
+    model = client.post('/admin/models', headers=admin(), json={'alias':'no-key-model','provider_id':provider,'upstream_model':'mock','operations':['generation']}).json()['id']
+    calls = []
+    async def fake(*args): calls.append(True)
+    monkeypatch.setattr(providers, 'completion', fake)
+    url = f'/admin/models/{model}/test'
+    assert client.post(url, headers=admin(), json={'operation':'generation'}).status_code == 503
+    assert client.put(f'/admin/providers/{provider}/key', headers=admin(), json={'api_key':'fake'}).status_code == 200
+    assert client.put(f'/admin/models/{model}/active', headers=admin(), json={'active':False}).status_code == 200
+    assert client.post(url, headers=admin(), json={'operation':'generation'}).status_code == 404
+    assert calls == [] and client.get('/admin/usage/requests', headers=admin()).json() == []
+
+
+def test_admin_model_test_timeout_and_invalid_response(context, monkeypatch):
+    client, _ = context
+    _, model, _ = configure(client, ['generation'])
+    async def timeout(*args): raise TimeoutError('secret')
+    monkeypatch.setattr(providers, 'completion', timeout)
+    response = client.post(f'/admin/models/{model}/test', headers=admin(), json={'operation':'generation'})
+    assert response.status_code == 504 and 'secret' not in response.text and 'x-request-id' in response.headers
+    async def invalid(*args): return {'error':'secret'}
+    monkeypatch.setattr(providers, 'completion', invalid)
+    response = client.post(f'/admin/models/{model}/test', headers=admin(), json={'operation':'generation'})
+    assert response.status_code == 502 and 'secret' not in response.text
+    assert [record['status'] for record in client.get('/admin/usage/requests', headers=admin()).json()] == ['error', 'error']
