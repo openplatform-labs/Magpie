@@ -6,7 +6,11 @@ RUN pip install --no-cache-dir --no-compile --require-hashes -r requirements.txt
     && rm -rf /usr/local/lib/python3.13/site-packages/litellm/proxy/_experimental/out \
               /usr/local/lib/python3.13/site-packages/litellm/proxy/a2a \
               /usr/local/lib/python3.13/site-packages/litellm/proxy/agent_endpoints \
-              /usr/local/lib/python3.13/site-packages/litellm/a2a_protocol
+              /usr/local/lib/python3.13/site-packages/litellm/a2a_protocol \
+    && find /usr/local/lib/python3.13/site-packages/litellm/proxy/mcp_server -mindepth 1 -maxdepth 1 ! -name stdio_gate.py -exec rm -rf {} + \
+    && rm -f /usr/local/lib/python3.13/site-packages/litellm/proxy/admin_mcp.py \
+             /usr/local/lib/python3.13/site-packages/litellm/proxy/mcp_registry.json \
+             /usr/local/lib/python3.13/site-packages/litellm/proxy/mcp_tools.py
 RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin magpie
 COPY app ./app
 COPY migrations ./migrations
