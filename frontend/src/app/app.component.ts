@@ -202,6 +202,9 @@ export class AppComponent implements OnInit {
   selectDiscovery(provider: Connection): void {
     this.discoveryVersion++; this.discoveryProvider = provider; this.discoveryResult = null; this.discoveryError = ''; this.discoveryFilter = ''; this.discoveryLoading = false;
   }
+  private refreshSelectedDiscovery(providerId: number | null, change: Partial<Connection> = {}): void {
+    if (this.discoveryProvider?.id === providerId) this.selectDiscovery({...this.discoveryProvider, ...change});
+  }
   discoverProvider(): void {
     const provider = this.discoveryProvider; if (!provider || (!provider.configured && provider.provider_type !== 'chutes') || !provider.active || this.discoveryLoading) return;
     const version = ++this.discoveryVersion; this.discoveryLoading = true; this.discoveryError = ''; this.discoveryResult = null;
@@ -262,10 +265,10 @@ export class AppComponent implements OnInit {
 
   rotateProvider(): void {
     if (this.providerKeySaving) return;
-    this.providerKeySaving = true; this.error = '';
-    this.http.put('/admin/providers/' + this.rotateId + '/key', {api_key: this.rotateSecret}, {headers: this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
-      next: () => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.closeDrawer(); this.message = '공급자 키를 등록했습니다.'; this.login();}),
-      error: failure => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.error = this.uncertainSave(failure) ? '키 변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 감사 이력을 확인하세요.' : '키 교체에 실패했습니다.';})
+    const providerId = this.rotateId; this.refreshSelectedDiscovery(providerId); this.providerKeySaving = true; this.error = '';
+    this.http.put('/admin/providers/' + providerId + '/key', {api_key: this.rotateSecret}, {headers: this.headers()}).pipe(timeout({first: this.managementTimeoutMs})).subscribe({
+      next: () => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; this.refreshSelectedDiscovery(providerId, {configured:true}); this.closeDrawer(); this.message = '공급자 키를 등록했습니다.'; this.login();}),
+      error: failure => this.update(() => {this.providerKeySaving = false; this.rotateSecret = ''; if (this.uncertainSave(failure)) this.refreshSelectedDiscovery(providerId); this.error = this.uncertainSave(failure) ? '키 변경 결과를 확인하지 못했습니다. 처리되었을 수 있으므로 감사 이력을 확인하세요.' : '키 교체에 실패했습니다.';})
     });
   }
   refreshKeys(): void { this.http.get<ManagedKey[]>('/admin/api-keys', {headers: this.headers()}).subscribe({next: data => this.update(() => this.keys = data), error: () => this.update(() => this.error = '키 목록을 불러오지 못했습니다.')}); }
@@ -285,8 +288,8 @@ export class AppComponent implements OnInit {
     });
   }
   revokeKey(key: ManagedKey): void { if (!confirm(`키 ${key.name}을 폐기하시겠습니까?`)) return; this.http.delete('/admin/api-keys/' + key.id, {headers: this.headers()}).subscribe({next: () => {this.refreshKeys(); this.refreshObservability();}, error: () => this.update(() => this.error = '키 폐기에 실패했습니다.')}); }
-  removeProviderKey(provider: Connection): void { if (!confirm(`${provider.name}의 공급자 키를 제거하시겠습니까? 이미 진행 중인 요청은 계속될 수 있습니다.`)) return; this.http.delete('/admin/providers/' + provider.id + '/key', {headers:this.headers()}).subscribe({next: () => {this.message = '공급자 키를 제거했습니다.'; this.login();}, error: () => this.update(() => this.error = '공급자 키 제거에 실패했습니다.')}); }
-  toggleProvider(provider: Connection): void { if (!confirm(`${provider.name} 공급자를 ${provider.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/providers/' + provider.id + '/active', {active: !provider.active}, {headers: this.headers()}).subscribe({next: () => this.login(), error: () => this.update(() => this.error = '공급자 상태 변경에 실패했습니다.')}); }
+  removeProviderKey(provider: Connection): void { if (!confirm(`${provider.name}의 공급자 키를 제거하시겠습니까? 이미 진행 중인 요청은 계속될 수 있습니다.`)) return; this.refreshSelectedDiscovery(provider.id); this.http.delete('/admin/providers/' + provider.id + '/key', {headers:this.headers()}).subscribe({next: () => {this.refreshSelectedDiscovery(provider.id, {configured:false}); this.message = '공급자 키를 제거했습니다.'; this.login();}, error: failure => this.update(() => {if (this.uncertainSave(failure)) this.refreshSelectedDiscovery(provider.id); this.error = this.uncertainSave(failure) ? '키 제거 결과를 확인하지 못했습니다. 새로고침해 공급자 상태를 확인하세요.' : '공급자 키 제거에 실패했습니다.';})}); }
+  toggleProvider(provider: Connection): void { if (!confirm(`${provider.name} 공급자를 ${provider.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.refreshSelectedDiscovery(provider.id); this.http.put('/admin/providers/' + provider.id + '/active', {active: !provider.active}, {headers: this.headers()}).subscribe({next: () => {this.refreshSelectedDiscovery(provider.id, {active:!provider.active}); this.login();}, error: failure => this.update(() => {if (this.uncertainSave(failure)) this.refreshSelectedDiscovery(provider.id); this.error = this.uncertainSave(failure) ? '공급자 상태 변경 결과를 확인하지 못했습니다. 새로고침해 상태를 확인하세요.' : '공급자 상태 변경에 실패했습니다.';})}); }
   toggleModel(model: Model): void { if (!confirm(`${model.alias} 모델을 ${model.active ? '비활성화' : '활성화'}하시겠습니까?`)) return; this.http.put('/admin/models/' + model.id + '/active', {active: !model.active}, {headers: this.headers()}).subscribe({next: () => {this.refreshModels(); this.refreshObservability();}, error: () => this.update(() => this.error = '모델 상태 변경에 실패했습니다.')}); }
   resolveUsage(record: UsageRequest): void { const note = prompt('실행이 더 이상 진행 중이 아님을 확인한 근거를 입력하세요. 예산 예약은 별도 정산해야 합니다.'); if (!note?.trim()) return; this.http.post('/admin/usage/requests/' + encodeURIComponent(record.request_id) + '/resolve', {note:note.trim()}, {headers:this.headers()}).subscribe({next: () => {this.refreshObservability(); this.update(() => this.message = '요청을 결과 미확인으로 기록했습니다.');}, error: () => this.update(() => this.error = '요청을 정리하지 못했습니다. 현재 상태를 다시 확인하세요.')}); }
   private focusId(id: string): void { requestAnimationFrame(() => document.getElementById(id)?.focus()); }
