@@ -232,7 +232,7 @@ class SecretIn(StrictModel):
 
 class ModelIn(StrictModel):
     alias: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
-    upstream_model: str = Field(min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*$")
+    upstream_model: str = Field(min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_.:-]+(?:/[a-zA-Z0-9_.:-]+)*$")
     provider_id: int = Field(gt=0)
     operations: list[Literal["generation", "embedding", "decision"]] = Field(min_length=1, max_length=3)
     description: str | None = Field(default=None, max_length=1000)
@@ -1072,6 +1072,28 @@ def provider_credential_health(db: DB, _: Admin):
                 status = 'unreadable'
         results.append({'provider_id':provider.id, 'name':provider.name, 'status':status})
     return {'providers':results, 'unreadable_count':sum(row['status'] == 'unreadable' for row in results)}
+
+
+@app.post('/admin/providers/{provider_id}/discover')
+async def discover_provider_models(provider_id: int, db: DB, actor: Admin):
+    provider = db.get(ProviderConnection, provider_id)
+    if not provider or not provider.active:
+        raise HTTPException(404, 'Provider is not active')
+    if not provider.encrypted_api_key:
+        raise HTTPException(400, 'provider_key_missing')
+    try:
+        secret = decrypt_secret(provider.encrypted_api_key)
+    except Exception:
+        raise HTTPException(503, 'provider_key_unavailable') from None
+    provider_type, base = provider.provider_type, provider.base_url
+    db.rollback()  # Do not hold a DB transaction open during the external request.
+    try:
+        result = await providers.discover_models(provider_type, secret, base)
+    except providers.DiscoveryError as exc:
+        raise HTTPException(502, 'provider_' + exc.code) from None
+    observability.audit(db, 'provider.discover', 'provider', provider_id, actor=actor)
+    commit(db)
+    return result
 
 
 @app.post("/admin/providers", status_code=201)

@@ -3474,3 +3474,95 @@ def test_documented_api_examples_with_mock_providers(context, monkeypatch):
     usage = client.get('/admin/usage', headers=admin()).json()
     assert {row['operation'] for row in usage} == {'generation', 'embedding', 'decision'}
     assert all(row['requests'] == 1 and row['status'] == 'success' for row in usage)
+
+
+@pytest.mark.parametrize(('kind','path','header','payload','expected'), [
+    ('openai', 'https://api.openai.com/v1/models', 'authorization', {'data':[{'id':'gpt-test'}]}, 'gpt-test'),
+    ('anthropic', 'https://api.anthropic.com/v1/models', 'x-api-key', {'data':[{'id':'claude-test'}], 'has_more':True}, 'claude-test'),
+    ('gemini', 'https://generativelanguage.googleapis.com/v1beta/models', 'x-goog-api-key', {'models':[{'name':'models/gemini-test'}]}, 'gemini-test'),
+    ('typesafe', 'https://api.typesafe.ai/v1/models', 'authorization', {'models':[{'name':'jev-latest'}]}, 'jev-latest'),
+    ('exaone', 'https://api.exaone.ai/v1/models', 'authorization', {'data':[{'id':'k-exaone-test'}]}, 'k-exaone-test'),
+])
+def test_provider_discovery_uses_bounded_mock_transport(context, monkeypatch, kind, path, header, payload, expected):
+    import httpx
+    client, _ = context
+    response = client.post('/admin/providers', headers=admin(), json={'name':kind, 'provider_type':kind, 'api_key':'synthetic-secret'})
+    assert response.status_code == 201
+    provider_id = response.json()['id']
+    seen = []
+    def handler(request):
+        seen.append(request)
+        assert str(request.url) == path
+        assert request.headers[header].endswith('synthetic-secret')
+        if kind == 'anthropic': assert request.headers['anthropic-version'] == '2023-06-01'
+        return httpx.Response(200, json=payload)
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    result = client.post(f'/admin/providers/{provider_id}/discover', headers=admin())
+    assert result.status_code == 200, result.text
+    assert result.json()['models'][0]['id'] == expected
+    assert result.json()['partial'] is (kind == 'anthropic')
+    assert len(seen) == 1 and 'synthetic-secret' not in result.text
+    assert any(row['action'] == 'provider.discover' for row in client.get('/admin/audit', headers=admin()).json())
+    assert client.post(f'/admin/providers/{provider_id}/discover').status_code == 401
+
+
+def test_provider_discovery_handles_missing_key_and_sanitizes_failures(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'example', 'provider_type':'exaone'}).json()['id']
+    assert client.post(f'/admin/providers/{provider}/discover', headers=admin()).json()['detail'] == 'provider_key_missing'
+    assert client.put(f'/admin/providers/{provider}/key', headers=admin(), json={'api_key':'synthetic-secret'}).status_code == 200
+    original = providers.httpx.AsyncClient
+    for status, detail in [(401, 'provider_authentication'), (404, 'provider_unsupported'), (429, 'provider_rate_limited'), (500, 'provider_unavailable')]:
+        def handler(request): return httpx.Response(status, text='synthetic-secret')
+        monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+        response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+        assert response.status_code == 502 and response.json()['detail'] == detail
+        assert 'synthetic-secret' not in response.text
+
+
+@pytest.mark.parametrize(('kind','first','second','query'), [
+    ('anthropic', {'data':[{'id':'a'}], 'has_more':True, 'last_id':'a'}, {'data':[{'id':'b'}], 'has_more':False}, ('after_id','a')),
+    ('gemini', {'models':[{'name':'models/a'}], 'nextPageToken':'cursor'}, {'models':[{'name':'models/b'}]}, ('pageToken','cursor')),
+    ('openai', {'data':[{'id':'a'}], 'has_more':True, 'last_id':'a'}, {'data':[{'id':'b'}], 'has_more':False}, ('after','a')),
+])
+def test_provider_discovery_pagination_is_bounded(context, monkeypatch, kind, first, second, query):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':kind,'provider_type':kind,'api_key':'synthetic'}).json()['id']
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1: return httpx.Response(200, json=first)
+        assert request.url.params[query[0]] == query[1]
+        return httpx.Response(200, json=second)
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 200
+    assert [item['id'] for item in response.json()['models']] == ['a','b']
+    assert response.json()['partial'] is False and len(seen) == 2
+
+
+def test_provider_discovery_never_follows_redirect(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'redirect','provider_type':'exaone','api_key':'synthetic'}).json()['id']
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(302, headers={'location':'https://untrusted.invalid/models'})
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 502 and len(requests) == 1
+
+
+def test_discovered_model_id_with_variant_can_be_registered(context):
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'router','provider_type':'openrouter'}).json()['id']
+    response = client.post('/admin/models', headers=admin(), json={'alias':'router-test','provider_id':provider,
+        'upstream_model':'vendor/model:variant','operations':['generation']})
+    assert response.status_code == 201
+    assert response.json()['upstream_model'] == 'vendor/model:variant'

@@ -73,6 +73,112 @@ PROVIDERS = {
 
 CODING_PROVIDERS = frozenset({'kimi_coding_global', 'kimi_coding_china', 'zai_coding', 'bigmodel_coding'})
 
+# Explicit endpoints avoid deriving destinations from a client request. Some
+# providers do not expose a model catalog; their models remain manually usable.
+DISCOVERY_BASES = {
+    'openai': 'https://api.openai.com/v1',
+    'anthropic': 'https://api.anthropic.com/v1',
+    'gemini': 'https://generativelanguage.googleapis.com/v1beta',
+    'typesafe': 'https://api.typesafe.ai/v1',
+    'xai': 'https://api.x.ai/v1',
+    'openrouter': 'https://openrouter.ai/api/v1',
+    'deepseek': 'https://api.deepseek.com',
+    'groq': 'https://api.groq.com/openai/v1',
+    'mistral': 'https://api.mistral.ai/v1',
+}
+
+
+class DiscoveryError(Exception):
+    def __init__(self, code: str):
+        self.code = code
+
+
+async def discover_models(provider_type: str, secret: str, custom_base: str | None = None):
+    """Fetch bounded pages on explicit request; never follow redirects."""
+    if provider_type in CODING_PROVIDERS:
+        raise DiscoveryError('unsupported')
+    if provider_type == 'openai_compatible':
+        try:
+            base = validate_custom_base(custom_base)
+        except ValueError:
+            raise DiscoveryError('unsupported') from None
+    else:
+        base = DISCOVERY_BASES.get(provider_type) or PROVIDERS[provider_type]['base']
+    if not base:
+        raise DiscoveryError('unsupported')
+    headers = {'Authorization': 'Bearer ' + secret, 'Accept': 'application/json'}
+    if provider_type == 'anthropic':
+        headers = {'x-api-key': secret, 'anthropic-version': '2023-06-01', 'Accept':'application/json'}
+    elif provider_type == 'gemini':
+        headers = {'x-goog-api-key': secret, 'Accept':'application/json'}
+    try:
+        models, seen, cursors = [], set(), set()
+        params, partial = {}, False
+        async with asyncio.timeout(min(UPSTREAM_TIMEOUT_SECONDS, 30)):
+            async with httpx.AsyncClient(timeout=min(UPSTREAM_TIMEOUT_SECONDS, 30), follow_redirects=False, trust_env=False) as client:
+                for page in range(10):
+                    async with client.stream('GET', base.rstrip('/') + '/models', headers=headers, params=params) as response:
+                        if response.status_code in (401, 403):
+                            raise DiscoveryError('authentication')
+                        if response.status_code == 404:
+                            raise DiscoveryError('unsupported')
+                        if response.status_code == 429:
+                            raise DiscoveryError('rate_limited')
+                        if response.status_code != 200:
+                            raise DiscoveryError('unavailable')
+                        chunks, size = [], 0
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > 2 * 1024 * 1024:
+                                raise DiscoveryError('invalid_response')
+                            chunks.append(chunk)
+                    try:
+                        payload = json.loads(b''.join(chunks))
+                    except (ValueError, UnicodeError, RecursionError):
+                        raise DiscoveryError('invalid_response') from None
+                    items = payload.get('models' if provider_type in ('typesafe', 'gemini') else 'data') if isinstance(payload, dict) else None
+                    if not isinstance(items, list):
+                        raise DiscoveryError('invalid_response')
+                    for item in items:
+                        if len(models) >= 1000:
+                            partial = True
+                            break
+                        if not isinstance(item, dict):
+                            continue
+                        name = item.get('name' if provider_type in ('typesafe', 'gemini') else 'id')
+                        if provider_type == 'gemini' and isinstance(name, str):
+                            name = name.removeprefix('models/')
+                        if not isinstance(name, str) or not name or len(name) > 200 or name in seen:
+                            continue
+                        seen.add(name)
+                        label = item.get('displayName') if provider_type == 'gemini' else item.get('name')
+                        models.append({'id': name, 'name': label[:200] if isinstance(label, str) else name})
+                    more = bool(payload.get('has_more') or payload.get('nextPageToken'))
+                    if partial or not more:
+                        break
+                    if provider_type == 'gemini':
+                        cursor, key = payload.get('nextPageToken'), 'pageToken'
+                    elif provider_type in ('openai', 'anthropic'):
+                        cursor, key = payload.get('last_id'), 'after' if provider_type == 'openai' else 'after_id'
+                    else:
+                        partial = True
+                        break
+                    if not isinstance(cursor, str) or not cursor or len(cursor) > 512 or cursor in cursors:
+                        partial = True
+                        break
+                    cursors.add(cursor)
+                    params = {key: cursor}
+                    if page == 9:
+                        partial = True
+        return {'models': models, 'partial': partial}
+
+    except DiscoveryError:
+        raise
+    except (TimeoutError, httpx.TimeoutException):
+        raise DiscoveryError('timeout') from None
+    except (httpx.HTTPError, ValueError, TypeError):
+        raise DiscoveryError('unavailable') from None
+
 
 def validate_custom_base(base: str | None) -> str:
     allowed = {item.strip().rstrip('/') for item in os.environ.get('MAGPIE_ALLOWED_PROVIDER_BASES', '').split(',') if item.strip()}

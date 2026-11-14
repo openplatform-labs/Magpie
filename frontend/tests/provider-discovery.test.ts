@@ -1,0 +1,37 @@
+import '@angular/compiler';
+import { strict as assert } from 'node:assert';
+import { ChangeDetectorRef, Injector, runInInjectionContext } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Subject } from 'rxjs';
+import { AppComponent } from '../src/app/app.component';
+import { SessionLifecycle } from '../src/app/session-lifecycle';
+
+const requests: {url: string; result: Subject<any>}[] = [];
+const http = {post: (url: string) => {const result = new Subject<any>(); requests.push({url, result}); return result.asObservable();}};
+const injector = Injector.create({providers: [SessionLifecycle, {provide: HttpClient, useValue:http},
+  {provide: ChangeDetectorRef, useValue:{markForCheck() {}}}]});
+const component = runInInjectionContext(injector, () => new AppComponent());
+(globalThis as any).requestAnimationFrame = () => 0;
+const jev = {id:1, name:'Jev', provider_type:'typesafe', configured:true, active:true};
+const exaone = {id:2, name:'EXAONE', provider_type:'exaone', configured:true, active:true};
+component.connections = [jev, exaone];
+component.selectDiscovery(jev); component.discoverProvider(); component.discoverProvider();
+assert.equal(requests.length, 1);
+component.selectDiscovery(exaone);
+requests[0].result.next({models:[{id:'jev-latest',name:'jev-latest'}], partial:false});
+assert.equal(component.discoveryResult, null);
+component.discoverProvider();
+assert.equal(requests[1].url, '/admin/providers/2/discover');
+requests[1].result.next({models:[{id:'vendor/model:variant',name:'Example'}], partial:false});
+assert.equal(component.discoveryResult?.models[0].id, 'vendor/model:variant');
+component.registerDiscoveredModel('vendor/model:variant');
+assert.equal(component.activePage, 'models');
+assert.equal(component.providerId, 2);
+assert.equal(component.upstream, 'vendor/model:variant');
+assert(component.showModelForm && component.generation && !component.decision);
+component.selectDiscovery(jev); component.registerDiscoveredModel('jev-latest');
+assert(component.decision && !component.generation && !component.embedding);
+assert(!component.registerableModelId('vendor/../model'));
+component.selectDiscovery({...exaone, configured:false}); component.discoverProvider();
+assert.equal(requests.length, 2);
+console.log('Discovery respects provider selection and sends selected models to the registration form.');

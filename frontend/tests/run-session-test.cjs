@@ -6,7 +6,7 @@ const { buildSync } = require('esbuild');
 
 const directory = mkdtempSync(join(tmpdir(), 'magpie-session-test-'));
 try {
-  for (const name of ['session-lifecycle', 'key-issuance', 'catalog-loading', 'model-provider-selection', 'edit-selection']) {
+  for (const name of ['session-lifecycle', 'key-issuance', 'catalog-loading', 'model-provider-selection', 'provider-discovery', 'edit-selection']) {
     const output = join(directory, `${name}.cjs`);
     buildSync({ entryPoints: [`tests/${name}.test.ts`], outfile: output,
       bundle: true, platform: 'node', format: 'cjs', logLevel: 'warning',
