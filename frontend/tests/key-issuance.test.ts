@@ -74,6 +74,10 @@ async function timeoutKeepsIdempotencyKey(): Promise<void> {
   result = new Subject<unknown>(); component.issueKey();
   assert.equal(ids.at(-1), requestId);
   result.complete();
+  component.issuedKey = 'synthetic-one-time-key'; component.openDrawer('issueKey');
+  component.closeDrawer(); assert.equal(component.issuedKey, '');
+  assert(component.keyIssueUncertain); // Closing must not erase the retry safeguard.
+  component.openDrawer('issueKey'); assert.equal(component.issuedKey, '');
   console.log('Timed-out issuance releases the drawer and retains the idempotency key.');
 }
 timeoutKeepsIdempotencyKey().catch(error => { console.error(error); process.exitCode = 1; });
