@@ -35,3 +35,15 @@ component.providerId = 5; component.modelProviderChanged();
 assert.deepEqual([component.generation, component.embedding, component.decision], [false, true, false]);
 component.selectModelOperation('generation', true);
 assert.deepEqual([component.generation, component.embedding, component.decision], [true, false, false]);
+
+let focused = '';
+(globalThis as any).requestAnimationFrame = (callback: () => void) => callback();
+(globalThis as any).document = {querySelector: (selector: string) => ({focus: () => { focused = selector; }})};
+for (const [providerId, expected] of [[1, 'decision'], [2, 'generation'], [5, 'embedding']] as const) {
+  component.providerId = providerId;
+  component.generation = component.embedding = component.decision = false;
+  component.addModel();
+  assert.equal(focused, `[name="${expected}"]`);
+  assert.equal(component.modelOperationError, true);
+}
+console.log('Missing operation focuses an enabled choice for each provider group.');
