@@ -1188,9 +1188,9 @@ def create_key(body: KeyIn, db: DB, _: Admin,
 
 @app.get("/admin/api-keys")
 def list_keys(db: DB, _: Admin):
-    rows = db.scalars(select(ClientKey).options(selectinload(ClientKey.grants)).order_by(ClientKey.id)).all()
+    rows = db.execute(select(ClientKey, (ClientKey.expires_at <= func.now()).label('expired')).options(selectinload(ClientKey.grants)).order_by(ClientKey.id)).all()
     legacy_budget_ids = set(db.scalars(select(KeyBudget.client_key_id)).all())
-    return [{"id": k.id, "name": k.name, "prefix": k.key_prefix, "active": k.active, "expires_at": k.expires_at, "requests_per_minute": k.requests_per_minute, "model_ids": [g.model_id for g in k.grants], "legacy_budget": k.id in legacy_budget_ids} for k in rows]
+    return [{"id": k.id, "name": k.name, "prefix": k.key_prefix, "active": k.active, "expired": bool(expired), "expires_at": k.expires_at, "requests_per_minute": k.requests_per_minute, "model_ids": [g.model_id for g in k.grants], "legacy_budget": k.id in legacy_budget_ids} for k, expired in rows]
 
 
 @app.delete("/admin/api-keys/{key_id}", status_code=204)

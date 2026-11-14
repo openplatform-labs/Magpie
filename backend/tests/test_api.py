@@ -1221,9 +1221,12 @@ def test_key_expiration_is_applied_at_issuance(context):
     assert client.get('/v1/models', headers={'Authorization':'Bearer '+key['key']}).status_code == 200
     listed = next(item for item in client.get('/admin/api-keys', headers=admin()).json() if item['id'] == key['id'])
     assert datetime.fromisoformat(listed['expires_at']).replace(tzinfo=timezone.utc) == future
+    assert listed['expired'] is False
     expired = client.post('/admin/api-keys', headers=admin(), json={**base, 'expires_at':past.isoformat()})
     assert expired.status_code == 201
     assert client.get('/v1/models', headers={'Authorization':'Bearer '+expired.json()['key']}).status_code == 401
+    listed_expired = next(item for item in client.get('/admin/api-keys', headers=admin()).json() if item['id'] == expired.json()['id'])
+    assert listed_expired['expired'] is True
 
 
 def test_admin_bootstrap_sessions_and_audit(context):
