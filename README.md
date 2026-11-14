@@ -43,6 +43,7 @@ Cerebras, Novita, Synthetic과 SambaNova는 각 공급자의 모델 목록 API�
 
 - `POST /admin/users`, `POST /admin/sessions`, `DELETE /admin/sessions/current`: 계정 생성과 로그인·로그아웃
 - `POST /admin/providers`, `PUT /admin/providers/{id}/key`: 공급자 등록·키 교체
+- `PUT /admin/providers/{id}/name`: 공급자 연결 이름 변경 (모델과 키 연결 유지)
 - `PUT /admin/providers/{id}/model-group`: 모델 용도에 맞게 공급자 그룹 변경
 - `POST /admin/providers/{id}/discover`: 공급자 모델 목록 조회 (관리자의 명시적 요청 시 외부 연결)
 - `POST /admin/models/{id}/test`: 등록된 모델의 지정 작업을 실제 공급자에 한 번 테스트 (관리자 요청, 과금 가능)

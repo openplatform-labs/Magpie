@@ -245,6 +245,10 @@ class ProviderGroupIn(StrictModel):
     model_group: Literal['general', 'decision', 'embedding']
 
 
+class ProviderNameIn(StrictModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
 class ModelIn(StrictModel):
     alias: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
     upstream_model: str = Field(min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_.:-]+(?:/[a-zA-Z0-9_.:-]+)*$")
@@ -1145,6 +1149,19 @@ def set_provider_model_group(provider_id: int, body: ProviderGroupIn, db: DB, ac
     observability.audit(db, 'provider.group.change', 'provider', p.id, actor=actor)
     commit(db)
     return {'id': p.id, 'model_group': p.model_group}
+
+
+@app.put('/admin/providers/{provider_id}/name')
+def set_provider_name(provider_id: int, body: ProviderNameIn, db: DB, actor: Admin):
+    provider = db.scalar(select(ProviderConnection).where(ProviderConnection.id == provider_id).with_for_update())
+    if not provider:
+        raise HTTPException(404, 'Provider not found')
+    if provider.name == body.name:
+        return {'id': provider.id, 'name': provider.name}
+    provider.name = body.name
+    observability.audit(db, 'provider.name.change', 'provider', provider.id, actor=actor)
+    commit(db)
+    return {'id': provider.id, 'name': provider.name}
 
 
 def change_provider_key(provider_id: int, secret: str | None, db: Session, actor: str):
