@@ -1,0 +1,11 @@
+# Explicit TLS termination. Default bind remains local; set deployment-specific
+# values and access controls before exposing the service externally.
+services:
+  backend:
+    ports: !reset []
+  frontend:
+    ports: !override ["${MAGPIE_TLS_BIND:-127.0.0.1}:${MAGPIE_TLS_PORT:-8443}:443"]
+    volumes:
+      - ./deploy/nginx.tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${MAGPIE_TLS_CERT:?Set MAGPIE_TLS_CERT to an absolute certificate path}:/run/magpie-tls/cert.pem:ro
+      - ${MAGPIE_TLS_KEY:?Set MAGPIE_TLS_KEY to an absolute private key path}:/run/magpie-tls/key.pem:ro

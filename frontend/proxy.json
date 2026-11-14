@@ -1,0 +1,1 @@
+{"/api": {"target": "http://localhost:8000"}, "/admin": {"target": "http://localhost:8000"}, "/v1": {"target": "http://localhost:8000"}, "/health": {"target": "http://localhost:8000"}, "/auth": {"target": "http://localhost:8000"}}

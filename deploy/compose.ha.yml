@@ -1,0 +1,7 @@
+# Local multi-backend topology; PostgreSQL remains a single instance.
+# Usage: docker compose -f docker-compose.yml -f deploy/compose.ha.yml up --build -d
+services:
+  backend:
+    ports: !reset []
+    deploy:
+      replicas: 2
