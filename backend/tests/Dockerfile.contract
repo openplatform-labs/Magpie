@@ -1,0 +1,6 @@
+ARG BASE_IMAGE=magpie-backend:latest
+FROM ${BASE_IMAGE}
+USER root
+# Test-only layer; the production image and its pinned dependencies are unchanged.
+RUN pip install --no-cache-dir pytest==9.2.0
+USER magpie
