@@ -1207,6 +1207,25 @@ def test_rate_limit_expiration_and_live_access_updates(context, monkeypatch):
     assert 'api_key.update' in actions and 'model.deactivate' in actions and 'provider.deactivate' in actions
 
 
+def test_key_expiration_is_applied_at_issuance(context):
+    from datetime import datetime, timedelta, timezone
+    client, _ = context
+    _, model_id, _ = configure(client, ['embedding'])
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    base = {'name':'expiry-at-issuance', 'model_ids':[model_id]}
+    assert client.post('/admin/api-keys', headers=admin(), json={**base, 'expires_at':'2030-01-01T00:00:00'}).status_code == 422
+    issued = client.post('/admin/api-keys', headers=admin(), json={**base, 'expires_at':future.isoformat()})
+    assert issued.status_code == 201
+    key = issued.json()
+    assert client.get('/v1/models', headers={'Authorization':'Bearer '+key['key']}).status_code == 200
+    listed = next(item for item in client.get('/admin/api-keys', headers=admin()).json() if item['id'] == key['id'])
+    assert datetime.fromisoformat(listed['expires_at']).replace(tzinfo=timezone.utc) == future
+    expired = client.post('/admin/api-keys', headers=admin(), json={**base, 'expires_at':past.isoformat()})
+    assert expired.status_code == 201
+    assert client.get('/v1/models', headers={'Authorization':'Bearer '+expired.json()['key']}).status_code == 401
+
+
 def test_admin_bootstrap_sessions_and_audit(context):
     client, db = context
     payload = {'username': 'admin', 'password': 'correct horse battery staple'}
