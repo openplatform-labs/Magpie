@@ -23,8 +23,12 @@ def request(method, path, token, body=None):
             try:
                 parsed = json.loads(error.read())
                 detail = parsed.get('error', {}) if isinstance(parsed, dict) else {}
+                message = detail.get('message')
+                stages = {'Provider request failed': 'provider request',
+                          'Provider response failed': 'provider response'}
+                stage = stages.get(message, 'other') if isinstance(message, str) else 'other'
                 print('Unexpected 502:', {'type':detail.get('type'), 'code':detail.get('code'),
-                                          'request_id':error.headers.get('X-Request-ID')}, flush=True)
+                                          'stage':stage, 'request_id':error.headers.get('X-Request-ID')}, flush=True)
             except (ValueError, AttributeError):
                 print('Unexpected 502: non-JSON proxy response', flush=True)
         return error.code, None
