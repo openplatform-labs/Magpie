@@ -171,6 +171,16 @@ def test_example_bootstrap_token_cannot_authenticate(context, monkeypatch):
     assert client.get('/admin/providers', headers=admin()).status_code == 200
 
 
+def test_bootstrap_token_length_matches_authentication_limit(context, monkeypatch):
+    from app.security import valid_bootstrap_token
+    client, _ = context
+    assert not valid_bootstrap_token('a' * 31)
+    assert valid_bootstrap_token('a' * 512)
+    assert not valid_bootstrap_token('a' * 513)
+    monkeypatch.setenv('MAGPIE_ADMIN_TOKEN', 'a' * 513)
+    assert client.get('/admin/providers', headers=admin()).status_code == 503
+
+
 def test_auth_secret_encryption_and_revocation(context):
     client, db = context
     assert client.get('/admin/providers').status_code == 401

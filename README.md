@@ -15,7 +15,7 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 2026-11-14 기준 PostgreSQL 19는 RC 2이므로 `postgres:19rc2`를 사용합니다. 정식 출시 후 이미지와 호환성을 재검증합니다.
 
 1. `.env.example`을 `.env`로 복사하고 DB 비밀번호와 `DATABASE_URL`을 일치시킵니다. URL의 특수문자는 인코딩합니다.
-2. `MAGPIE_ADMIN_TOKEN`을 충분히 긴 임의 값(최소 32자), `MAGPIE_ENCRYPTION_KEY`를 Fernet 키로 설정합니다. 공개 예제 토큰을 그대로 쓰면 최초 관리자 인증과 준비 상태가 거부됩니다. 예: `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` (cryptography 설치 필요). 두 값은 비밀로 관리합니다.
+2. `MAGPIE_ADMIN_TOKEN`을 충분히 긴 임의 값(32~512자), `MAGPIE_ENCRYPTION_KEY`를 Fernet 키로 설정합니다. 공개 예제 토큰을 그대로 쓰면 최초 관리자 인증과 준비 상태가 거부됩니다. 예: `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` (cryptography 설치 필요). 두 값은 비밀로 관리합니다.
 3. `docker compose up --build -d`
 4. `docker compose exec backend alembic upgrade head`
 5. `http://localhost:8080`에서 `.env`의 관리자 토큰으로 연결해 첫 관리자 계정을 생성한 뒤, 계정으로 로그인해 공급자 키와 모델을 등록합니다. 첫 계정이 생성되면 부트스트랩 토큰은 더 이상 인증에 사용할 수 없습니다. 계정 로그인을 확인한 후 `.env`의 `MAGPIE_ADMIN_TOKEN`을 비우고 백엔드를 재생성할 수 있습니다. 공급자별로 실제 제공하는 모델과 기능을 선택해야 합니다.

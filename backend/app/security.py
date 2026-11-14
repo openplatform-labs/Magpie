@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 def valid_bootstrap_token(value: str) -> bool:
     """Reject the public example credential as well as missing/short values."""
-    return len(value) >= 32 and value != 'replace-with-a-random-token-at-least-32-characters'
+    return 32 <= len(value) <= 512 and value != 'replace-with-a-random-token-at-least-32-characters'
 
 
 def cipher() -> Fernet:
