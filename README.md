@@ -16,6 +16,8 @@ Gemini 목록에서 공급자가 `generateContent` 또는 `embedContent`를 명�
 
 Together AI 목록은 [기존 공식 Python SDK의 모델 목록 계약](https://github.com/togethercomputer/together-python/blob/main/src/together/resources/models.py)을 지원합니다. 목록에 `chat` 또는 `embedding` 유형이 명시된 경우에만 해당 용도를 참고 정보로 표시합니다. 공급자가 구형 목록 API를 중단했거나 다른 응답을 반환하면 모델 ID를 직접 등록하십시오.
 
+OpenRouter는 생성형과 임베딩 출력 모델을 함께 조회하고, 최대 10페이지·1,000개까지 반환합니다. 공급자가 해당 모델에 채팅 또는 임베딩 API를 명시한 경우 용도 참고 정보를 표시하며, 한도를 넘는 목록은 일부만 조회되었다고 안내합니다. NVIDIA NIM은 NVIDIA 호스팅 모델 목록을 사용합니다.
+
 Cerebras, Novita, Synthetic과 SambaNova는 각 공급자의 모델 목록 API를 사용합니다. [Chutes 공개 목록](https://www.chutes.ai/agents)은 키 없이 조회하며 목록 요청에 저장된 키를 보내지 않습니다. 모델 호출에는 키가 필요합니다. Fireworks는 [계정별 모델 목록 API](https://docs.fireworks.ai/api-reference/list-models)에서 공개 `fireworks` 계정만 조회하므로 개인 계정 모델은 직접 등록해야 합니다. 이 공급자들의 실제 목록·추론 호출은 테스트하지 않았습니다.
 
 공급자 연결은 범용, 판단 전용 또는 임베딩 전용으로 구분합니다. 범용 연결에서는 신규 모델의 용도를 직접 선택해야 하며 전용 연결에는 해당 용도의 모델만 등록할 수 있습니다. 신규 모델은 생성형·판단형·임베딩 중 하나를 선택합니다. 기존에 여러 용도로 등록된 모델은 이관 시 유지됩니다. 관리자 API의 기존 클라이언트가 `model_group`을 생략하면 TypeSafe는 판단 전용, 그 밖의 공급자는 범용으로 등록합니다.

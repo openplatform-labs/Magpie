@@ -3499,6 +3499,7 @@ def test_documented_api_examples_with_mock_providers(context, monkeypatch):
     ('novita', 'https://api.novita.ai/openai/v1/models', 'authorization', {'data':[{'id':'vendor/novita-test'}]}, 'vendor/novita-test'),
     ('synthetic', 'https://api.synthetic.new/openai/v1/models', 'authorization', {'data':[{'id':'hf:vendor/model'}]}, 'hf:vendor/model'),
     ('sambanova', 'https://api.sambanova.ai/v1/models', 'authorization', {'data':[{'id':'samba-test'}]}, 'samba-test'),
+    ('nvidia_nim', 'https://integrate.api.nvidia.com/v1/models', 'authorization', {'data':[{'id':'nvidia/test'}]}, 'nvidia/test'),
     ('fireworks_ai', 'https://api.fireworks.ai/v1/accounts/fireworks/models', 'authorization', {'models':[{'name':'accounts/fireworks/models/test','displayName':'Test'}]}, 'accounts/fireworks/models/test'),
 ])
 def test_provider_discovery_uses_bounded_mock_transport(context, monkeypatch, kind, path, header, payload, expected):
@@ -3936,3 +3937,48 @@ def test_chutes_public_catalog_never_sends_or_requires_a_key(context, monkeypatc
         session.commit()
     assert client.post(f'/admin/providers/{provider}/discover', headers=admin()).status_code == 200
     assert len(requests) == 2
+
+
+def test_openrouter_catalog_includes_embeddings_and_follows_bounded_offsets(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'router','provider_type':'openrouter','api_key':'synthetic'}).json()['id']
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert request.url.params['output_modalities'] == 'text,embeddings'
+        assert request.url.params['limit'] == '100'
+        offset = int(request.url.params['offset'])
+        assert offset in (0, 100)
+        items = [{'id':f'vendor/chat-{i}','endpoints':['/api/v1/chat/completions']} for i in range(100)] if offset == 0 else [
+            {'id':'vendor/embed','endpoints':['/api/v1/embeddings']},
+            {'id':'vendor/other','endpoints':['/api/alpha/decisions']},
+            {'id':'vendor/unknown','endpoints':['/api/v1/embeddings', None]}]
+        return httpx.Response(200, json={'data':items,'total_count':103})
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 200
+    result = response.json()
+    assert len(requests) == 2 and len(result['models']) == 103 and result['partial'] is False
+    models = {item['id']:item for item in result['models']}
+    assert models['vendor/chat-0']['advertised_operations'] == ['generation']
+    assert models['vendor/embed']['advertised_operations'] == ['embedding']
+    assert 'advertised_operations' not in models['vendor/other']
+    assert 'advertised_operations' not in models['vendor/unknown']
+
+
+def test_openrouter_catalog_reports_incomplete_when_page_limit_is_reached(context, monkeypatch):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'router','provider_type':'openrouter','api_key':'synthetic'}).json()['id']
+    requests = []
+    def handler(request):
+        offset = int(request.url.params['offset'])
+        requests.append(offset)
+        return httpx.Response(200, json={'data':[{'id':f'example/{i}'} for i in range(offset, offset + 100)], 'total_count':1200})
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    result = client.post(f'/admin/providers/{provider}/discover', headers=admin()).json()
+    assert requests == list(range(0, 1000, 100))
+    assert len(result['models']) == 1000 and result['partial'] is True

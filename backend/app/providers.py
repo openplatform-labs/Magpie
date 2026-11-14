@@ -89,6 +89,7 @@ DISCOVERY_BASES = {
     'chutes': 'https://llm.chutes.ai/v1',
     'synthetic': 'https://api.synthetic.new/openai/v1',
     'sambanova': 'https://api.sambanova.ai/v1',
+    'nvidia_nim': 'https://integrate.api.nvidia.com/v1',
     'together_ai': 'https://api.together.xyz/v1',
     # Fireworks' public account, not the caller's private account catalog.
     'fireworks_ai': 'https://api.fireworks.ai/v1/accounts/fireworks',
@@ -129,7 +130,8 @@ async def discover_models(provider_type: str, secret: str | None, custom_base: s
         headers['Content-Type'] = 'application/json'
     try:
         models, seen, cursors = [], set(), set()
-        params, partial = {}, False
+        params = {'output_modalities':'text,embeddings', 'limit':100, 'offset':0} if provider_type == 'openrouter' else {}
+        partial = False
         async with asyncio.timeout(min(UPSTREAM_TIMEOUT_SECONDS, 30)):
             async with httpx.AsyncClient(timeout=min(UPSTREAM_TIMEOUT_SECONDS, 30), follow_redirects=False, trust_env=False) as client:
                 for page in range(10):
@@ -182,7 +184,27 @@ async def discover_models(provider_type: str, secret: str | None, custom_base: s
                                 model['advertised_operations'] = available
                         if provider_type == 'together_ai' and item.get('type') in ('chat', 'embedding'):
                             model['advertised_operations'] = ['generation' if item['type'] == 'chat' else 'embedding']
+                        endpoints = item.get('endpoints') if provider_type == 'openrouter' else None
+                        if isinstance(endpoints, list) and all(isinstance(endpoint, str) for endpoint in endpoints):
+                            available = [operation for endpoint, operation in
+                                         (('/api/v1/chat/completions', 'generation'), ('/api/v1/embeddings', 'embedding')) if endpoint in endpoints]
+                            if available:
+                                model['advertised_operations'] = available
                         models.append(model)
+                    if provider_type == 'openrouter':
+                        offset = params['offset'] + len(items)
+                        total = payload.get('total_count')
+                        if type(total) is int and total >= 0:
+                            more = offset < total
+                        else:
+                            more = len(items) >= params['limit']
+                        if partial or not more:
+                            break
+                        if not items or page == 9:
+                            partial = True
+                            break
+                        params = {**params, 'offset':offset}
+                        continue
                     more = bool(payload.get('has_more') or payload.get('nextPageToken'))
                     if partial or not more:
                         break
