@@ -1,6 +1,8 @@
 #!/bin/sh
 # Uses only this script's isolated project; never touches the user's running DB.
 set -eu
+unset POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL MAGPIE_ADMIN_TOKEN MAGPIE_ENCRYPTION_KEY
+unset MAGPIE_OIDC_ISSUER MAGPIE_OIDC_AUTHORIZATION_URL MAGPIE_OIDC_TOKEN_URL MAGPIE_OIDC_JWKS_URL MAGPIE_OIDC_CLIENT_ID MAGPIE_OIDC_CLIENT_SECRET MAGPIE_OIDC_REDIRECT_URI MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS
 cd "$(dirname "$0")/../.."
 test_dir=$(mktemp -d /tmp/magpie-db-failure.XXXXXX)
 test_project="magpiedbtest$(date +%s)$$"
