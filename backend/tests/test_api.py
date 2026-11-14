@@ -2982,7 +2982,7 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
     from openai import AsyncOpenAI
     client, _ = context
     conn = client.post('/admin/providers', headers=admin(), json={'name':provider_type,'provider_type':provider_type,'api_key':'mock-secret'}).json()
-    model = client.post('/admin/models', headers=admin(), json={'alias':'test-chat','provider_id':conn['id'],'upstream_model':'mock','operations':['generation']}).json()
+    model = client.post('/admin/models', headers=admin(), json={'alias':'test-chat','provider_id':conn['id'],'upstream_model':'k-exaone_v2.5','operations':['generation']}).json()
     model_id = model['id']
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'test','model_ids':[model_id]}).json()
     assert client.post('/admin/prices', headers=admin(), json={'model_id':model_id,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000'}).status_code == 201
@@ -3020,11 +3020,13 @@ def test_openai_sdk_stream_records_only_explicit_reported_usage(context, monkeyp
                 finally: await http.aclose()
         return OwnedStream()
     monkeypatch.setattr(providers, 'completion', fake_transport)
-    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'test-chat','messages':[{'role':'user','content':'x'}],'stream':True,'stream_options':{'include_usage':True}})
+    response = client.post('/v1/chat/completions', headers={'Authorization':'Bearer '+key['key']}, json={'model':'test-chat','messages':[{'role':'user','content':'x'}],'stream':True,'stream_options':{'include_usage':True},'reasoning_effort':'low'})
     assert response.status_code == 200 and '[DONE]' in response.text and 'Provider stream failed' not in response.text
     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ') and line != 'data: [DONE]']
     assert any(event.get('choices') and event['choices'][0]['delta'].get('reasoning_content') == 'thinking' for event in events)
     assert observed[0]['stream_options']['include_usage'] is True
+    assert observed[0]['model'] == 'k-exaone_v2.5'
+    assert observed[0]['reasoning_effort'] == 'low'
     usage_events = [event['usage'] for event in events if event.get('usage') is not None]
     if raw_usage is None:
         assert usage_events == []
