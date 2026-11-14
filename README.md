@@ -18,10 +18,10 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 2. `MAGPIE_ADMIN_TOKEN`을 충분히 긴 임의 값(32~512자), `MAGPIE_ENCRYPTION_KEY`를 Fernet 키로 설정합니다. 공개 예제 토큰을 그대로 쓰면 최초 관리자 인증과 준비 상태가 거부됩니다. 예: `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` (cryptography 설치 필요). 두 값은 비밀로 관리합니다.
 3. `docker compose up --build -d`
 4. `docker compose exec backend alembic upgrade head`
-5. `http://localhost:8080`에서 `.env`의 관리자 토큰으로 연결해 첫 관리자 계정을 생성한 뒤, 계정으로 로그인해 공급자 키와 모델을 등록합니다. 첫 계정이 생성되면 부트스트랩 토큰은 더 이상 인증에 사용할 수 없습니다. 계정 로그인을 확인한 후 `.env`의 `MAGPIE_ADMIN_TOKEN`을 비우고 백엔드를 재생성할 수 있습니다. 공급자별로 실제 제공하는 모델과 기능을 선택해야 합니다.
+5. `http://localhost:8080`에서 **처음 설정하시나요?**를 열고 `.env`의 관리자 토큰으로 연결해 첫 관리자 계정을 생성합니다. 계정으로 로그인한 뒤 공급자와 모델을 등록하세요. 첫 계정이 생성되면 부트스트랩 토큰은 더 이상 인증에 사용할 수 없습니다. 계정 로그인을 확인한 후 `.env`의 `MAGPIE_ADMIN_TOKEN`을 비우고 백엔드를 재생성할 수 있습니다. 공급자별로 실제 제공하는 모델과 기능을 선택해야 합니다.
 6. 클라이언트 키를 발급하면 원문은 한 번만 표시됩니다. API 요청 시 `Authorization: Bearer <클라이언트 키>`를 사용합니다.
 
-실행 중인 기존 개발 환경의 `.env`에는 로컬 DB용 비밀번호와 관리자 토큰 및 암호화 키가 생성되어 있습니다. 키를 교체하거나 분실하면 기존에 암호화된 공급자 키를 복호화할 수 없으므로 안전하게 백업해야 합니다. Compose는 포트를 loopback에만 바인딩합니다. `docker compose down`은 DB 볼륨을 유지합니다.
+`.env`의 DB 비밀번호, 관리자 토큰과 암호화 키는 직접 설정합니다. 암호화 키를 교체하거나 분실하면 기존에 암호화된 공급자 키를 복호화할 수 없으므로 안전하게 백업해야 합니다. Compose는 포트를 loopback에만 바인딩합니다. `docker compose down`은 DB 볼륨을 유지합니다.
 
 ## API
 
@@ -45,6 +45,8 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 - `POST /admin/retention/preview`, `POST /admin/retention/apply`: 이력 삭제 미리보기·수동 적용
 
 관리 API는 `Authorization: Bearer <관리자 토큰>`이 필요합니다. API 요청 필드는 현재 명시된 일부만 허용되며 나머지는 오류로 반환합니다. 허용 모델 ID는 영숫자, 점, 하이픈, 밑줄만 포함할 수 있습니다. 사용자 정의 공급자 주소는 운영자 허용 목록에 있어야 합니다. 공급자별로 지원하지 않는 기능은 미지원입니다. `/v1` 오류는 OpenAI 형태로 정규화하지만 완전한 호환성은 아직 검증되지 않았습니다.
+
+모델 등록 후 호출하는 방법은 [생성형·임베딩·판단형 API 예시](docs/api-examples.md)를 참조하세요.
 
 ## 검증
 
