@@ -811,22 +811,29 @@ try:
         current = client.post('/admin/sessions', json={'username':user['username'], 'password':'recovered test password'})
         assert current.status_code == 201
         test_admin = {'Authorization':'Bearer ' + current.json()['token']}
+        test_calls = []
         async def test_generation(config, data):
+            test_calls.append('generation')
             return {'choices':[{'index':0, 'message':{'role':'assistant','content':'OK'}, 'finish_reason':'stop'}],
                     'usage':{'prompt_tokens':2,'completion_tokens':1}}
         async def test_embedding(config, data):
+            test_calls.append('embedding')
             return {'data':[{'index':0, 'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2}}
         async def test_decision(config, data):
+            test_calls.append('decision')
             return {'answers':[{'type':'predicate', 'name':'test', 'probability':0.9}],
                     'usage':{'input_tokens':2,'output_tokens':1}}
+        test_models = {}
         for operation, provider_type, mock in [('generation','exaone',test_generation),
                                                 ('embedding','exaone',test_embedding),
                                                 ('decision','typesafe',test_decision)]:
             connection = client.post('/admin/providers', headers=test_admin, json={
-                'name':'admin-test-' + operation, 'provider_type':provider_type, 'api_key':'fake'}).json()
+                'name':'admin-test-' + operation, 'provider_type':provider_type, 'api_key':'fake',
+                'model_group': {'generation':'general','embedding':'embedding','decision':'decision'}[operation]}).json()
             registered = client.post('/admin/models', headers=test_admin, json={
                 'alias':'admin-test-' + operation, 'provider_id':connection['id'],
                 'upstream_model':'mock-model', 'operations':[operation]}).json()
+            test_models[operation] = registered['id']
             previous = getattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation])
             setattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation], mock)
             try:
@@ -839,6 +846,32 @@ try:
                 assert usage is not None and usage.client_key_id is None and usage.model_id == registered['id']
                 assert usage.operation == operation and usage.status == 'success' and usage.input_tokens == 2
                 assert session.scalar(select(AuditLog.id).where(AuditLog.action == 'model.test', AuditLog.target_id == str(registered['id'])))
+        # The same three registered purposes must be enforced for client calls.
+        issued = client.post('/admin/api-keys', headers=test_admin, json={
+            'name':'purpose-client', 'model_ids':list(test_models.values())})
+        assert issued.status_code == 201, issued.text
+        client_auth = {'Authorization':'Bearer ' + issued.json()['key']}
+        requests = {
+            'generation':('/v1/chat/completions', {'messages':[{'role':'user','content':'test'}]}),
+            'embedding':('/v1/embeddings', {'input':'test'}),
+            'decision':('/v1/decisions', {'input':'test','questions':[{'type':'predicate','name':'test','instructions':'Is this a test?'}]}),
+        }
+        old_handlers = {name:getattr(providers, name) for name in ('completion','embedding','decision')}
+        providers.completion, providers.embedding, providers.decision = test_generation, test_embedding, test_decision
+        try:
+            test_calls.clear()
+            for allowed in test_models:
+                for operation, (path, body) in requests.items():
+                    if allowed != operation:
+                        response = client.post(path, headers=client_auth, json={'model':'admin-test-' + allowed, **body})
+                        assert response.status_code == 403, (allowed, operation, response.text)
+            assert not test_calls
+            for operation, (path, body) in requests.items():
+                response = client.post(path, headers=client_auth, json={'model':'admin-test-' + operation, **body})
+                assert response.status_code == 200, (operation, response.text)
+            assert test_calls == ['generation','embedding','decision']
+        finally:
+            for name, handler in old_handlers.items(): setattr(providers, name, handler)
         # Two operators can deactivate different users at the same time. The
         # shared bootstrap row must serialize the final-active-user check.
         with Session(test_engine) as session:
