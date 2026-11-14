@@ -9,7 +9,8 @@ import { SessionLifecycle } from '../src/app/session-lifecycle';
 let requests = 0;
 let result = new Subject<unknown>();
 const ids: string[] = [];
-const http = { post: (_url: string, _body: unknown, options: {headers: Record<string, string>}) => { requests++; ids.push(options.headers['Idempotency-Key']); return result.asObservable(); } };
+const bodies: any[] = [];
+const http = { post: (_url: string, _body: unknown, options: {headers: Record<string, string>}) => { requests++; bodies.push(_body); ids.push(options.headers['Idempotency-Key']); return result.asObservable(); } };
 const injector = Injector.create({ providers: [
   SessionLifecycle,
   {provide: HttpClient, useValue:http},
@@ -22,15 +23,23 @@ component.refreshObservability = () => {};
 (globalThis as any).requestAnimationFrame = () => 0;
 component.keyName = 'test';
 component.modelIds = [1];
+component.issueExpiry = 'not-a-time';
+component.issueKey();
+assert.equal(requests, 0);
+assert.match(component.error, /만료 시각/);
+component.issueExpiry = '2027-01-15:1305';
 component.issueKey();
 component.issueKey();
 assert.equal(requests, 1);
+assert.equal(bodies[0].expires_at, new Date(2027, 0, 15, 13, 5).toISOString());
 assert(component.issuingKey);
 result.next({id:1, key:'test-key'});
 result.complete();
 assert.equal(component.issuedKey, 'test-key');
+assert.equal(component.issueExpiry, '');
 assert(!component.issuingKey);
 result = new Subject<unknown>();
+component.issueExpiry = '2027-02-15:1305';
 component.issueKey();
 assert.equal(requests, 2);
 result.error(new Error('offline'));
@@ -42,6 +51,7 @@ assert.equal(refreshes, 2); // Once after success, once after uncertain failure.
 result = new Subject<unknown>();
 component.issueKey();
 assert.equal(ids[1], ids[2]);
+assert.equal(bodies[1].expires_at, bodies[2].expires_at);
 result.error(new Error('offline'));
 result = new Subject<unknown>();
 (globalThis as any).confirm = () => false;
