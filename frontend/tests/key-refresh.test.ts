@@ -1,0 +1,23 @@
+import '@angular/compiler';
+import { strict as assert } from 'node:assert';
+import { ChangeDetectorRef, Injector, runInInjectionContext } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Subject } from 'rxjs';
+import { AppComponent } from '../src/app/app.component';
+import { SessionLifecycle } from '../src/app/session-lifecycle';
+
+const responses: Subject<any>[] = [];
+const http = {get: () => {const response = new Subject<any>(); responses.push(response); return response.asObservable();}};
+const injector = Injector.create({providers:[SessionLifecycle, {provide:HttpClient, useValue:http}, {provide:ChangeDetectorRef, useValue:{markForCheck(){}}}]});
+const component = runInInjectionContext(injector, () => new AppComponent());
+component.refreshKeys(); component.refreshKeys();
+responses[1].next([{id:1, name:'current', expired:true}]);
+responses[0].next([{id:1, name:'stale', expired:false}]);
+assert.equal(component.keys[0].name, 'current');
+assert.equal(component.keys[0].expired, true);
+assert.equal(component.keysLoading, false);
+component.refreshKeys(); component.logout();
+responses[2].next([{id:1, name:'stale session'}]);
+assert.deepEqual(component.keys, []);
+assert.equal(component.keysLoading, false);
+console.log('Key refresh rejects stale responses and clears on logout.');
