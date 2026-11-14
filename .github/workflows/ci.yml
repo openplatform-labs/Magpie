@@ -73,7 +73,7 @@ jobs:
       - run: docker compose build backend frontend
       - run: docker compose run -T --rm --no-deps backend python -c 'import os, pwd; assert os.geteuid() == 10001 and os.access(pwd.getpwuid(os.geteuid()).pw_dir, os.W_OK) and not os.access("/app/app/main.py", os.W_OK)'
       - run: docker compose run -T --rm --no-deps backend python -m pip check
-      - run: docker compose run -T --rm --no-deps backend python -c 'from pathlib import Path; import app.main; assert not Path("/usr/local/lib/python3.13/site-packages/litellm/proxy/_experimental/out").exists()'
+      - run: docker compose run -T --rm --no-deps backend python -c 'from pathlib import Path; import app.main; base = Path("/usr/local/lib/python3.13/site-packages/litellm"); assert all(not (base / path).exists() for path in ("proxy/_experimental/out", "proxy/a2a", "proxy/agent_endpoints", "a2a_protocol"))'
       - run: sh backend/tests/bootstrap_retire.sh
       - run: MAGPIE_HA_SOAK_SECONDS=5 sh backend/tests/ha_load.sh
       - run: sh backend/tests/provider_stall.sh

@@ -49,7 +49,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 @media (max-width: 760px) { .page-heading { gap: 12px; flex-wrap: wrap; } }
 
 /* Registration and editing take place in a right-hand drawer. */
-.drawer-layer { position: fixed; inset: 0; z-index: 1000; }
+.drawer-layer { position: fixed; inset: 64px 0 0; z-index: 1000; }
 .drawer-backdrop { position: absolute; inset: 0; background: rgba(13, 32, 46, .48); }
 .drawer.panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(560px, 100%); box-sizing: border-box; margin: 0; padding: 28px 32px 40px; border: 0; border-radius: 0; overflow-y: auto; box-shadow: -12px 0 36px rgba(15, 37, 51, .14); }
 .drawer-header { background: #fff; color: #1b2c3b; height: auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 18px; border-bottom: 1px solid #e1e9ed; }
