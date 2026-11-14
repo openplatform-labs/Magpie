@@ -28,7 +28,9 @@ def request_json(method, path, token=ADMIN, body=None):
 
 status, provider = request_json('POST', '/admin/providers', body={'name':'mock','provider_type':'exaone','api_key':'fake'})
 assert status == 201
-status, model = request_json('POST', '/admin/models', body={'alias':'mock','provider_id':provider['id'],'upstream_model':'mock','operations':['generation','embedding']})
+status, model = request_json('POST', '/admin/models', body={'alias':'mock','provider_id':provider['id'],'upstream_model':'mock','operations':['generation']})
+assert status == 201
+status, embed_model = request_json('POST', '/admin/models', body={'alias':'mock-embed','provider_id':provider['id'],'upstream_model':'mock','operations':['embedding']})
 assert status == 201
 request_headers = {'Idempotency-Key':'offline-proxy-test-0123456789'}
 issuance_body = {'name':'one-request-across-workers','model_ids':[model['id']]}
@@ -43,14 +45,14 @@ assert status == 200 and len([entry for entry in keys if entry['name'] == issuan
 assert request('POST','/admin/api-keys',body=issuance_body,extra_headers=request_headers)[0] == 409
 print('Concurrent and repeated key issuance through the HA proxy created exactly one test key.')
 for operation in ('generation','embedding'):
-    status, _ = request_json('POST','/admin/prices',body={'model_id':model['id'],'operation':operation,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000' if operation == 'generation' else '0'})
+    status, _ = request_json('POST','/admin/prices',body={'model_id':model['id'] if operation == 'generation' else embed_model['id'],'operation':operation,'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'10000' if operation == 'generation' else '0'})
     assert status == 201
-status, key = request_json('POST','/admin/api-keys',body={'name':'stall-test','model_ids':[model['id']]})
+status, key = request_json('POST','/admin/api-keys',body={'name':'stall-test','model_ids':[model['id'],embed_model['id']]})
 assert status == 201
 assert request_json('PUT',f"/admin/api-keys/{key['id']}/budget",body={'currency':'USD','limit_amount':'10','reserve_per_request':'0.1'})[0] == 200
 
 started = time.monotonic()
-status, result = request_json('POST','/v1/embeddings',key['key'],{'model':'mock','input':'hold-for-db-test'})
+status, result = request_json('POST','/v1/embeddings',key['key'],{'model':'mock-embed','input':'hold-for-db-test'})
 assert status == 504 and result['error']['code'] == 'provider_timeout'
 assert 0.8 <= time.monotonic() - started < 8
 status, body = request('POST','/v1/chat/completions',key['key'],{'model':'mock','messages':[{'role':'user','content':'mock'}],'stream':True})

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.main import app, db_session
-from app.models import CatalogLock, ClientKey, ProviderConnection
+from app.models import CatalogLock, ClientKey, ProviderConnection, ModelCapability
 from app import providers
 
 @pytest.fixture
@@ -112,8 +112,17 @@ def test_request_body_total_read_deadline(path):
 def configure(client, operations=None):
     p = client.post('/admin/providers', headers=admin(), json={'name': 'LG', 'provider_type': 'exaone', 'api_key': 'provider-secret'})
     assert p.status_code == 201
-    m = client.post('/admin/models', headers=admin(), json={'alias': 'exaone-chat', 'provider_id': p.json()['id'], 'upstream_model': 'k-exaone_v2.5', 'operations': operations or ['generation', 'embedding']})
+    selected = operations or ['generation', 'embedding']
+    m = client.post('/admin/models', headers=admin(), json={'alias': 'exaone-chat', 'provider_id': p.json()['id'], 'upstream_model': 'k-exaone_v2.5', 'operations': [selected[0]]})
     assert m.status_code == 201
+    # Exercise backward compatibility with pre-group registrations.
+    if len(selected) > 1:
+        sessions = client.app.dependency_overrides[db_session]()
+        session = next(sessions)
+        for operation in selected[1:]:
+            session.add(ModelCapability(model_id=m.json()['id'], operation=operation, api_mode={'embedding':'embeddings', 'decision':'decisions', 'generation':'chat_completions'}[operation]))
+        session.commit()
+        sessions.close()
     k = client.post('/admin/api-keys', headers=admin(), json={'name': 'test', 'model_ids': [m.json()['id']]})
     assert k.status_code == 201
     return p.json()['id'], m.json()['id'], k.json()
@@ -1207,7 +1216,11 @@ def test_multi_operation_model_uses_operation_specific_prices(context, monkeypat
     from decimal import Decimal
     client, _ = context
     provider = client.post('/admin/providers', headers=admin(), json={'name':'openai-pricing','provider_type':'openai','api_key':'fake'}).json()['id']
-    model = client.post('/admin/models', headers=admin(), json={'alias':'multi','provider_id':provider,'upstream_model':'model','operations':['generation','embedding','decision']}).json()['id']
+    model = client.post('/admin/models', headers=admin(), json={'alias':'multi','provider_id':provider,'upstream_model':'model','operations':['generation']}).json()['id']
+    # Historical multi-operation model, retained by migration.
+    with Session(context[1]) as session:
+        session.add_all([ModelCapability(model_id=model, operation='embedding', api_mode='embeddings'), ModelCapability(model_id=model, operation='decision', api_mode='decisions')])
+        session.commit()
     key = client.post('/admin/api-keys', headers=admin(), json={'name':'multi','model_ids':[model]}).json()
     token_price = {'model_id':model,'currency':'USD','basis':'tokens','input_per_million':'1','output_per_million':'2'}
     assert client.post('/admin/prices', headers=admin(), json=token_price).status_code == 422
@@ -1679,7 +1692,7 @@ def test_openai_decision_adapter_roundtrip_without_network(context, monkeypatch)
     import httpx
     client, _ = context
     provider = client.post('/admin/providers', headers=admin(), json={'name':'openai-mock','provider_type':'openai','api_key':'fake-key'}).json()['id']
-    model = client.post('/admin/models', headers=admin(), json={'alias':'openai-judge','provider_id':provider,'upstream_model':'gpt-6-luna','operations':['generation','decision']})
+    model = client.post('/admin/models', headers=admin(), json={'alias':'openai-judge','provider_id':provider,'upstream_model':'gpt-6-luna','operations':['decision']})
     assert model.status_code == 201
     issued = client.post('/admin/api-keys', headers=admin(), json={'name':'openai','model_ids':[model.json()['id']]}).json()
     key = issued['key']
@@ -1912,7 +1925,7 @@ def test_capability_verification_history_and_invalidation(context):
     assert client.put(url, headers=admin(), json=body).status_code == 409
     body['expected_version'] = updated['verification_version']
     assert client.put(url, headers=admin(), json={**body, 'status':'provider_verified', 'note':'operator evidence'}).status_code == 200
-    changed = client.put(f'/admin/models/{model_id}', headers=admin(), json={**model_body, 'upstream_model':'other'}).json()
+    changed = client.put(f'/admin/models/{model_id}', headers=admin(), json={**model_body, 'upstream_model':'other', 'operations':['embedding']}).json()
     assert next(c for c in changed['capabilities'] if c['operation'] == 'embedding')['verification_status'] == 'unverified'
     events = client.get(f'/admin/models/{model_id}/verification-history', headers=admin()).json()
     assert [event['status'] for event in events] == ['unverified','provider_verified','unverified','mock_verified']
@@ -3566,3 +3579,33 @@ def test_discovered_model_id_with_variant_can_be_registered(context):
         'upstream_model':'vendor/model:variant','operations':['generation']})
     assert response.status_code == 201
     assert response.json()['upstream_model'] == 'vendor/model:variant'
+
+
+def test_provider_groups_enforce_model_purpose_without_network(context):
+    client, _ = context
+    def connect(name, provider_type, group):
+        return client.post('/admin/providers', headers=admin(), json={'name':name, 'provider_type':provider_type, 'model_group':group})
+    assert connect('bad-jev', 'typesafe', 'general').status_code == 422
+    assert connect('bad-decision', 'exaone', 'decision').status_code == 422
+    assert connect('bad-coding', 'zai_coding', 'embedding').status_code == 422
+    general = connect('general', 'openai', 'general').json()['id']
+    embedding = connect('embedding', 'openai', 'embedding').json()['id']
+    decision = connect('decision', 'typesafe', 'decision').json()['id']
+    def register(provider, alias, operations):
+        return client.post('/admin/models', headers=admin(), json={'provider_id':provider, 'alias':alias, 'upstream_model':alias, 'operations':operations})
+    assert register(general, 'general-gen', ['generation']).status_code == 201
+    assert register(general, 'general-embed', ['embedding']).status_code == 201
+    assert register(general, 'general-mixed', ['generation', 'embedding']).status_code == 422
+    embedded = register(embedding, 'embed', ['embedding'])
+    assert embedded.status_code == 201
+    assert register(embedding, 'embed-gen', ['generation']).status_code == 422
+    jev = register(decision, 'jev', ['decision'])
+    assert jev.status_code == 201
+    assert register(decision, 'jev-gen', ['generation']).status_code == 422
+    groups = {item['name']:item['model_group'] for item in client.get('/admin/providers', headers=admin()).json()}
+    assert groups == {'general':'general', 'embedding':'embedding', 'decision':'decision'}
+    key = client.post('/admin/api-keys', headers=admin(), json={'name':'purpose-check', 'model_ids':[embedded.json()['id'], jev.json()['id']]}).json()['key']
+    auth = {'Authorization':'Bearer '+key}
+    for alias in ('embed', 'jev'):
+        response = client.post('/v1/chat/completions', headers=auth, json={'model':alias, 'messages':[{'role':'user', 'content':'test'}]})
+        assert response.status_code == 403

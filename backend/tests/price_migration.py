@@ -24,6 +24,7 @@ try:
     subprocess.run(['alembic','upgrade','0021_usage_resolution'], env=env, check=True)
     with test_engine.begin() as connection:
         connection.execute(text("INSERT INTO provider_connections (id,name,provider_type,active) VALUES (1,'mock','openai',true)"))
+        connection.execute(text("INSERT INTO provider_connections (id,name,provider_type,active) VALUES (2,'jev','typesafe',true)"))
         connection.execute(text("INSERT INTO model_registrations (id,alias,upstream_model,provider_id,active) VALUES (1,'multi','mock',1,true)"))
         connection.execute(text("INSERT INTO model_capabilities (model_id,operation,api_mode) VALUES (1,'generation','chat_completions'),(1,'embedding','embeddings'),(1,'decision','decisions')"))
         connection.execute(text("INSERT INTO client_keys (id,name,key_hash,key_prefix,active) VALUES (1,'mock','fakehash','mgp_test',true)"))
@@ -32,6 +33,9 @@ try:
         connection.execute(text("INSERT INTO usage_records (request_id,client_key_id,model_id,operation,status,started_at,finished_at,price_id,estimated_cost,currency) VALUES ('historical',1,1,'generation','success',now(),now(),1,42,'USD')"))
         connection.execute(text("SELECT setval(pg_get_serial_sequence('model_prices','id'), 2)"))
     subprocess.run(['alembic','upgrade','head'], env=env, check=True)
+    with test_engine.connect() as connection:
+        assert connection.execute(text('SELECT id, model_group FROM provider_connections ORDER BY id')).all() == [(1, 'general'), (2, 'decision')]
+        assert connection.execute(text('SELECT count(*) FROM model_capabilities WHERE model_id = 1')).scalar_one() == 3
     with Session(test_engine) as session:
         assert session.get(ModelPrice, 1).operation is None
         assert session.get(ModelPrice, 2).operation == 'decision'

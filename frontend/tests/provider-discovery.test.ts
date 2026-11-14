@@ -12,8 +12,8 @@ const injector = Injector.create({providers: [SessionLifecycle, {provide: HttpCl
   {provide: ChangeDetectorRef, useValue:{markForCheck() {}}}]});
 const component = runInInjectionContext(injector, () => new AppComponent());
 (globalThis as any).requestAnimationFrame = () => 0;
-const jev = {id:1, name:'Jev', provider_type:'typesafe', configured:true, active:true};
-const exaone = {id:2, name:'EXAONE', provider_type:'exaone', configured:true, active:true};
+const jev = {id:1, name:'Jev', provider_type:'typesafe', model_group:'decision' as const, configured:true, active:true};
+const exaone = {id:2, name:'EXAONE', provider_type:'exaone', model_group:'general' as const, configured:true, active:true};
 component.connections = [jev, exaone];
 component.selectDiscovery(jev); component.discoverProvider(); component.discoverProvider();
 assert.equal(requests.length, 1);

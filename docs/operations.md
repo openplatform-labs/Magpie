@@ -2,6 +2,8 @@
 
 ## 실행 및 마이그레이션
 
+공급자 그룹 이관(0027)은 기존 TypeSafe 연결을 판단 전용으로, 그 밖의 연결을 범용으로 설정합니다. 기존 모델·키·복수 작업 설정은 유지합니다. 신규 모델에는 작업 하나만 등록할 수 있고 전용 공급자 연결은 해당 작업만 허용합니다. 그룹은 생성 후 변경하지 않으므로 다른 그룹이 필요하면 별도 공급자 연결을 등록하고 모델을 이동하십시오. 이관 전에 백업하십시오.
+
 README의 환경 설정 후 `docker compose up --build -d`와 `docker compose exec backend alembic upgrade head`를 실행합니다. 준비 상태 `/health/ready`는 PostgreSQL 19와 적용된 마이그레이션이 현재 코드의 head에 일치하는지, 암호화 키 형식이 올바른지, 관리자 계정이 없다면 부트스트랩 토큰이 최소 32자인지 확인합니다. 암호화 키가 저장된 모든 키와 일치하는지, 공급자나 IdP가 실제로 동작하는지는 확인하지 않습니다. `/health/live`는 프로세스 생존만 확인합니다. PostgreSQL 19 RC에서 정식 버전으로 옮기기 전에 해당 릴리스의 업그레이드 지침을 확인해야 합니다.
 
 백엔드 이미지는 해시가 포함된 `backend/requirements.txt`로 설치하며 CI에서 `uv.lock`의 운영 의존성과 일치하는지 검사합니다. 의존성을 변경할 때는 `backend`에서 `uv lock` 후 `uv export --locked --no-dev --no-emit-project -o requirements.txt`로 내보내고 `python tests/check_requirements.py`와 테스트를 실행하십시오. `uv` 버전은 CI와 동일한 0.13.7을 사용합니다. 컨테이너에서 `pip check`도 실행하지만 취약점이나 모든 런타임 호환성을 증명하는 검사는 아닙니다.

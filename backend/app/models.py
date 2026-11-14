@@ -10,6 +10,7 @@ class ProviderConnection(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100), unique=True)
     provider_type: Mapped[str] = mapped_column(String(50))
+    model_group: Mapped[str] = mapped_column(String(20), default='general', server_default='general')
     encrypted_api_key: Mapped[str | None] = mapped_column(String)
     base_url: Mapped[str | None] = mapped_column(String(500))
     active: Mapped[bool] = mapped_column(Boolean, default=True)

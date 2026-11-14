@@ -208,11 +208,20 @@ class OIDCCallbackIn(BaseModel):
 class ProviderIn(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     provider_type: str = Field(min_length=1, max_length=50)
+    model_group: Literal['general', 'decision', 'embedding'] | None = None
 
     @model_validator(mode="after")
     def known_provider(self):
         if self.provider_type not in providers.PROVIDERS:
             raise ValueError("Unsupported provider")
+        if self.model_group is None:
+            self.model_group = 'decision' if self.provider_type == 'typesafe' else 'general'
+        if self.provider_type == 'typesafe' and self.model_group != 'decision':
+            raise ValueError('TypeSafe connections require the decision group')
+        if self.model_group == 'decision' and self.provider_type not in ('typesafe', 'openai'):
+            raise ValueError('Decision connections require TypeSafe or OpenAI')
+        if self.provider_type in providers.CODING_PROVIDERS and self.model_group != 'general':
+            raise ValueError('Coding plan connections require the general group')
         return self
     api_key: str | None = Field(default=None, min_length=1, max_length=4096, repr=False)
     base_url: str | None = Field(default=None, max_length=500)
@@ -1054,7 +1063,7 @@ def unlink_oidc_identity(identity_id: int, db: DB, actor: Admin):
 
 @app.get("/admin/providers")
 def list_providers(db: DB, _: Admin):
-    return [{"id": p.id, "name": p.name, "provider_type": p.provider_type, "active": p.active, "configured": bool(p.encrypted_api_key), "base_url": p.base_url} for p in db.scalars(select(ProviderConnection).order_by(ProviderConnection.id))]
+    return [{"id": p.id, "name": p.name, "provider_type": p.provider_type, "model_group": p.model_group, "active": p.active, "configured": bool(p.encrypted_api_key), "base_url": p.base_url} for p in db.scalars(select(ProviderConnection).order_by(ProviderConnection.id))]
 
 
 @app.get('/admin/provider-credential-health')
@@ -1098,12 +1107,12 @@ async def discover_provider_models(provider_id: int, db: DB, actor: Admin):
 
 @app.post("/admin/providers", status_code=201)
 def create_provider(body: ProviderIn, db: DB, _: Admin):
-    p = ProviderConnection(name=body.name, provider_type=body.provider_type, base_url=body.base_url if body.provider_type == "openai_compatible" else providers.PROVIDERS[body.provider_type]["base"], encrypted_api_key=encrypt_secret(body.api_key) if body.api_key is not None else None, active=True)
+    p = ProviderConnection(name=body.name, provider_type=body.provider_type, model_group=body.model_group, base_url=body.base_url if body.provider_type == "openai_compatible" else providers.PROVIDERS[body.provider_type]["base"], encrypted_api_key=encrypt_secret(body.api_key) if body.api_key is not None else None, active=True)
     db.add(p)
     flush(db)
     observability.audit(db, "provider.create", "provider", p.id, actor=_)
     commit(db)
-    return {"id": p.id, "name": p.name, "provider_type": p.provider_type, "configured": bool(p.encrypted_api_key)}
+    return {"id": p.id, "name": p.name, "provider_type": p.provider_type, "model_group": p.model_group, "configured": bool(p.encrypted_api_key)}
 
 
 def change_provider_key(provider_id: int, secret: str | None, db: Session, actor: str):
@@ -1165,6 +1174,8 @@ def validate_model(db: Session, body: ModelIn) -> ProviderConnection:
     p = db.get(ProviderConnection, body.provider_id)
     if not p or not p.active:
         raise HTTPException(404, "Provider not found")
+    if p.model_group in ('decision', 'embedding') and body.operations != [p.model_group]:
+        raise HTTPException(422, 'Model operation must match the dedicated provider group')
     if p.provider_type == "typesafe" and body.operations != ["decision"]:
         raise HTTPException(422, "TypeSafe supports decision operations only")
     if p.provider_type in providers.CODING_PROVIDERS and body.operations != ["generation"]:
@@ -1177,6 +1188,8 @@ def validate_model(db: Session, body: ModelIn) -> ProviderConnection:
 @app.post("/admin/models", status_code=201)
 def create_model(body: ModelIn, db: DB, _: Admin):
     lock_catalog(db)
+    if len(body.operations) != 1:
+        raise HTTPException(422, 'Choose one model operation')
     if db.scalar(select(ModelRoute.id).where(ModelRoute.alias == body.alias)):
         raise HTTPException(409, "Alias already belongs to a route")
     p = validate_model(db, body)
@@ -1200,6 +1213,9 @@ def update_model(model_id: int, body: ModelIn, db: DB, actor: Admin):
     row = db.scalar(select(ModelRegistration).where(ModelRegistration.id == model_id).with_for_update())
     if not row:
         raise HTTPException(404, "Model not found")
+    if len(body.operations) != 1 and (row.provider_id != body.provider_id or row.upstream_model != body.upstream_model or
+                                      set(body.operations) != {cap.operation for cap in row.capabilities}):
+        raise HTTPException(422, 'Choose one model operation')
     provider = validate_model(db, body)
     identity_changed = row.provider_id != body.provider_id or row.upstream_model != body.upstream_model
     if identity_changed:
