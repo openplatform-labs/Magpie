@@ -3,7 +3,7 @@ import asyncio
 import os
 import socket
 from app.main import app
-from app import main, providers, oidc
+from app import main, providers
 
 # Provider mocks must never fall through to a Python network client. PostgreSQL
 # connects through libpq; the server itself only accepts incoming sockets.
@@ -77,17 +77,3 @@ async def mock_decision(config, data):
 
 
 providers.decision = mock_decision
-
-
-async def mock_oidc_exchange(settings, code, verifier):
-    print('MOCK_OIDC_EXCHANGE_EXECUTED', flush=True)
-    await asyncio.sleep(0.05)
-    return 'fake-token', {}
-
-
-def mock_oidc_verify(settings, token, jwks, nonce_hash):
-    return 'ha-subject'
-
-
-oidc.exchange = mock_oidc_exchange
-oidc.verify = mock_oidc_verify

@@ -25,8 +25,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from .database import engine
 from .request_limit import BodyLimitMiddleware
-from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetAdjustment, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OIDCIdentity, OperationalPolicy, ModelCircuit, ModelRoute, RouteTarget, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
-from . import budgets, circuits, observability, oidc, providers, rate_limit
+from .models import AdminSession, AdminUser, BootstrapLock, CatalogLock, AuditLog, BudgetAdjustment, BudgetReservation, CapabilityVerificationEvent, KeyBudget, OperationalPolicy, ModelCircuit, ModelRoute, RouteTarget, ClientKey, ClientKeyGrant, ModelCapability, ModelPrice, ModelRegistration, ProviderConnection, UsageRecord
+from . import budgets, circuits, observability, providers, rate_limit
 from .security import cipher, decrypt_secret, encrypt_secret, hash_key, new_client_key, password_hash, password_verify, valid_bootstrap_token
 
 app = FastAPI(title="Magpie", version="0.2.0")
@@ -158,7 +158,7 @@ def admin_auth(request: Request, db: DB, authorization: str | None = Header(defa
     if len(raw) > 512:
         raise HTTPException(401, "Invalid credentials")
     session = db.scalar(select(AdminSession).join(AdminUser, AdminSession.user_id == AdminUser.id).where(
-        AdminSession.token_hash == hash_key(raw), AdminSession.revoked.is_(False),
+        AdminSession.token_hash == hash_key(raw), AdminSession.revoked.is_(False), AdminSession.oidc_identity_id.is_(None),
         AdminSession.expires_at > func.now(), AdminUser.active.is_(True)))
     if session:
         actor = f"admin:{session.user_id}"
@@ -191,18 +191,6 @@ class AdminCredentials(BaseModel):
 class NewPassword(BaseModel):
     model_config = ConfigDict(extra="forbid")
     password: str = Field(min_length=12, max_length=256, repr=False)
-
-
-class OIDCIdentityIn(StrictModel):
-    user_id: int = Field(gt=0)
-    subject: str = Field(min_length=1, max_length=255)
-
-
-class OIDCCallbackIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    state: str = Field(min_length=32, max_length=128)
-    browser_secret: str = Field(min_length=32, max_length=128, repr=False)
-    code: str = Field(min_length=1, max_length=4096, repr=False)
 
 
 def valid_provider_group(provider_type: str, model_group: str) -> bool:
@@ -992,83 +980,6 @@ def logout(db: DB, actor: Admin, authorization: str | None = Header(default=None
         session.revoked = True
         observability.audit(db, "admin.logout", "admin_user", session.user_id, actor=actor)
         commit(db)
-
-
-@app.get("/auth/oidc/config")
-def oidc_status():
-    try:
-        oidc.config()
-        return {"enabled": True}
-    except HTTPException:
-        return {"enabled": False}
-
-
-@app.post("/auth/oidc/start")
-def oidc_start(request: Request, db: DB):
-    settings = oidc.config()
-    peer = request.client.host if request.client else "unknown"
-    rate_limit.login_attempt(db, "oidc:" + peer, peer)
-    return JSONResponse(oidc.start(db, settings), headers={"Cache-Control": "no-store"})
-
-
-@app.post("/auth/oidc/callback")
-async def oidc_callback(body: OIDCCallbackIn, db: DB):
-    settings = oidc.config()
-    verifier, nonce_hash = oidc.consume(db, body.state, body.browser_secret)
-    try:
-        token, keys = await oidc.exchange(settings, body.code, verifier)
-        subject = oidc.verify(settings, token, keys, nonce_hash)
-    except Exception:
-        observability.audit(db, "admin.oidc.failed", "oidc", "unknown", actor="anonymous")
-        commit(db)
-        raise HTTPException(401, "SSO authentication failed") from None
-    identity = db.scalar(select(OIDCIdentity).where(OIDCIdentity.issuer == settings.issuer, OIDCIdentity.subject == subject).with_for_update())
-    user = db.scalar(select(AdminUser).where(AdminUser.id == identity.user_id).with_for_update()) if identity else None
-    if not identity or not user or not user.active:
-        observability.audit(db, "admin.oidc.denied", "oidc", "unlinked", actor="anonymous")
-        commit(db)
-        raise HTTPException(403, "SSO identity is not linked to an active administrator")
-    raw = "mga_" + secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=12)
-    db.add(AdminSession(token_hash=hash_key(raw), user_id=identity.user_id, oidc_identity_id=identity.id, expires_at=expires_at, revoked=False))
-    observability.audit(db, "admin.oidc.login", "admin_user", identity.user_id, actor=f"admin:{identity.user_id}")
-    commit(db)
-    return JSONResponse({"token": raw, "expires_at": expires_at.isoformat()}, headers={"Cache-Control": "no-store"})
-
-
-@app.post("/admin/oidc-identities", status_code=201)
-def link_oidc_identity(body: OIDCIdentityIn, db: DB, actor: Admin):
-    if actor == "bootstrap":
-        raise HTTPException(403, "Create an administrator account first")
-    settings = oidc.config()
-    # Serialize identity linking with account deactivation. A plain read can
-    # become stale while the foreign-key insert waits for the user row.
-    user = db.scalar(select(AdminUser).where(AdminUser.id == body.user_id).with_for_update().execution_options(populate_existing=True))
-    if not user or not user.active:
-        raise HTTPException(404, "Active administrator not found")
-    identity = OIDCIdentity(issuer=settings.issuer, subject=body.subject, user_id=user.id)
-    db.add(identity)
-    flush(db)
-    observability.audit(db, "admin.oidc.link", "oidc_identity", identity.id, actor=actor)
-    commit(db)
-    return {"id": identity.id, "issuer": identity.issuer, "subject": identity.subject, "user_id": identity.user_id}
-
-
-@app.get("/admin/oidc-identities")
-def list_oidc_identities(db: DB, _: Admin):
-    return [{"id": i.id, "issuer": i.issuer, "subject": i.subject, "user_id": i.user_id}
-            for i in db.scalars(select(OIDCIdentity).order_by(OIDCIdentity.id))]
-
-
-@app.delete("/admin/oidc-identities/{identity_id}", status_code=204)
-def unlink_oidc_identity(identity_id: int, db: DB, actor: Admin):
-    identity = db.scalar(select(OIDCIdentity).where(OIDCIdentity.id == identity_id).with_for_update())
-    if not identity:
-        raise HTTPException(404, "Identity not found")
-    db.execute(update(AdminSession).where(AdminSession.oidc_identity_id == identity.id).values(revoked=True, oidc_identity_id=None))
-    db.delete(identity)
-    observability.audit(db, "admin.oidc.unlink", "oidc_identity", identity_id, actor=actor)
-    commit(db)
 
 
 @app.get("/admin/providers")

@@ -12,9 +12,6 @@ import socket
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlparse
-import jwt
-from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from decimal import Decimal
@@ -25,12 +22,12 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from app.main import AdjustmentIn, CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, adjust_budget, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
-from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, RouteTarget, UsageRecord
+from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, OIDCIdentity, OIDCTransaction, RouteTarget, UsageRecord
 from app.rate_limit import consume
 from app.database import runtime_engine
 from app.recover_admin import recover
 from app.rotate_key import rotate
-from app import budgets, circuits, observability, oidc, providers
+from app import budgets, circuits, observability, providers
 
 # Permit psycopg's database-host DNS lookup and libpq's connections, while
 # blocking Python HTTP clients if a provider mock is accidentally omitted.
@@ -112,6 +109,22 @@ try:
         assert client.get('/admin/providers', headers=bootstrap).status_code == 401
         response = client.post('/admin/sessions', json=user); assert response.status_code == 201
         auth = {'Authorization': 'Bearer ' + response.json()['token']}
+        from app.maintenance import prune
+        from app.security import hash_key
+        legacy_token = 'mga_legacy_postgres'
+        with Session(test_engine) as session:
+            identity = OIDCIdentity(issuer='https://legacy.example', subject='legacy', user_id=1)
+            session.add(identity); session.flush()
+            session.add(AdminSession(user_id=1, oidc_identity_id=identity.id, token_hash=hash_key(legacy_token),
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+            session.add(AdminSession(user_id=1, oidc_identity_id=identity.id, token_hash=hash_key('expired-legacy'),
+                expires_at=datetime.now(timezone.utc) - timedelta(days=3)))
+            session.commit(); identity_id = identity.id
+        assert client.get('/admin/providers', headers={'Authorization':'Bearer '+legacy_token}).status_code == 401
+        with Session(test_engine) as session:
+            prune(session)
+            assert session.get(OIDCIdentity, identity_id) is not None
+            assert len(session.scalars(select(AdminSession).where(AdminSession.oidc_identity_id == identity_id)).all()) == 2
         # Hold the catalog lock in each possible winner, then start the other
         # operation. Verify both serialization orders without provider access.
         for group_first in (True, False):
@@ -441,88 +454,6 @@ try:
         with ThreadPoolExecutor(max_workers=12) as pool:
             results = list(pool.map(attempt, range(12)))
         assert results.count(200) == 4 and results.count(429) == 8, results
-        for setting_name, value in {'ISSUER':'https://identity.example','AUTHORIZATION_URL':'https://identity.example/authorize',
-                            'TOKEN_URL':'https://identity.example/token','JWKS_URL':'https://identity.example/keys',
-                            'CLIENT_ID':'magpie','REDIRECT_URI':'https://magpie.example/oidc/callback'}.items():
-            os.environ['MAGPIE_OIDC_' + setting_name] = value
-        linked = client.post('/admin/oidc-identities', headers=auth, json={'user_id': 1, 'subject': 'linked-subject'})
-        assert linked.status_code == 201, linked.text
-        link_user = client.post('/admin/users', headers=auth, json={'username':'link-race','password':'valid test password'}).json()['id']
-        with Session(test_engine) as locker, ThreadPoolExecutor(max_workers=1) as pool:
-            locked_user = locker.scalar(select(AdminUser).where(AdminUser.id == link_user).with_for_update())
-            locked_user.active = False
-            locker.flush()
-            future = pool.submit(client.post, '/admin/oidc-identities', headers=auth, json={'user_id':link_user,'subject':'link-race-subject'})
-            try:
-                try:
-                    future.result(timeout=0.25)
-                    raise AssertionError('Identity linking did not wait for administrator lock')
-                except FutureTimeout:
-                    pass
-            finally:
-                locker.commit()
-            assert future.result(timeout=10).status_code == 404
-        assert not any(identity['subject'] == 'link-race-subject' for identity in client.get('/admin/oidc-identities', headers=auth).json())
-        assert client.put(f'/admin/users/{race_user}/active', headers=auth, json={'active':True}).status_code == 200
-        assert client.post('/admin/oidc-identities', headers=auth, json={'user_id':race_user,'subject':'race-subject'}).status_code == 201
-        race_start = client.post('/auth/oidc/start').json()
-        verified = threading.Event()
-        original_exchange, original_oidc_verify = oidc.exchange, oidc.verify
-        async def fake_exchange(settings, code, verifier): return ('test-token', {})
-        def fake_verify(settings, token, keys, nonce_hash):
-            verified.set()
-            return 'race-subject'
-        oidc.exchange, oidc.verify = fake_exchange, fake_verify
-        try:
-            with Session(test_engine) as locker, ThreadPoolExecutor(max_workers=1) as pool:
-                locked_user = locker.scalar(select(AdminUser).where(AdminUser.id == race_user).with_for_update())
-                locked_user.active = False
-                locker.flush()
-                future = pool.submit(client.post, '/auth/oidc/callback', json={'state':race_start['state'],'browser_secret':race_start['browser_secret'],'code':'mock'})
-                try:
-                    assert verified.wait(10)
-                    try:
-                        future.result(timeout=0.25)
-                        raise AssertionError('SSO callback did not wait for the administrator row lock')
-                    except FutureTimeout:
-                        pass
-                finally:
-                    locker.commit()
-                assert future.result(timeout=10).status_code == 403
-        finally:
-            oidc.exchange, oidc.verify = original_exchange, original_oidc_verify
-        start = client.post('/auth/oidc/start').json()
-        nonce = parse_qs(urlparse(start['authorization_url']).query)['nonce'][0]
-        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        public = jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key(), as_dict=True)
-        public.update({'kid': 'test-key', 'use': 'sig'})
-        async def fake_oidc_exchange(settings, code, verifier):
-            token = jwt.encode({'iss': settings.issuer, 'sub':'linked-subject', 'aud':settings.client_id,
-                                'iat':int(time.time()), 'exp':int(time.time())+300, 'nonce':nonce},
-                               private, algorithm='RS256', headers={'kid':'test-key'})
-            return token, {'keys': [public]}
-        oidc.exchange = fake_oidc_exchange
-        sso = client.post('/auth/oidc/callback', json={'state':start['state'], 'browser_secret':start['browser_secret'], 'code':'offline'})
-        assert sso.status_code == 200, sso.text
-        sso_headers = {'Authorization': 'Bearer '+sso.json()['token']}
-        assert client.get('/admin/providers', headers=sso_headers).status_code == 200
-        # One state must remain single-use even when multiple workers receive
-        # the same callback concurrently; only the winner may exchange a code.
-        concurrent_start = client.post('/auth/oidc/start').json()
-        nonce = parse_qs(urlparse(concurrent_start['authorization_url']).query)['nonce'][0]
-        exchanges = []
-        async def counted_exchange(settings, code, verifier):
-            exchanges.append(True)
-            await asyncio.sleep(0.05)
-            return await fake_oidc_exchange(settings, code, verifier)
-        oidc.exchange = counted_exchange
-        callback = {'state':concurrent_start['state'], 'browser_secret':concurrent_start['browser_secret'], 'code':'offline'}
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(lambda _: client.post('/auth/oidc/callback', json=callback).status_code, range(8)))
-        assert results.count(200) == 1 and results.count(400) == 7, results
-        assert len(exchanges) == 1
-        assert client.delete('/admin/oidc-identities/'+str(linked.json()['id']), headers=auth).status_code == 204
-        assert client.get('/admin/providers', headers=sso_headers).status_code == 401
         routed = client.post('/admin/routes', headers=auth, json={'alias':'jev-route','operation':'decision',
             'targets':[{'model_id':model_id,'priority':0,'weight':1}]})
         assert routed.status_code == 201, routed.text
@@ -784,11 +715,12 @@ try:
         new_encryption_key = Fernet.generate_key().decode()
         try:
             with Session(test_engine) as session:
-                pending_sso = oidc.start(session, oidc.config())
+                pending_sso = OIDCTransaction(state_hash='legacy-state', browser_hash='legacy-browser', nonce_hash='legacy-nonce',
+                    encrypted_verifier=Fernet(saved_encryption.encode()).encrypt(b'legacy-verifier').decode(),
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), used=False)
+                session.add(pending_sso); session.commit()
                 assert rotate(session, saved_encryption, new_encryption_key) > 0
-                os.environ['MAGPIE_ENCRYPTION_KEY'] = new_encryption_key
-                verifier, _ = oidc.consume(session, pending_sso['state'], pending_sso['browser_secret'])
-                assert verifier
+                assert Fernet(new_encryption_key.encode()).decrypt(pending_sso.encrypted_verifier.encode()) == b'legacy-verifier'
         finally:
             os.environ['MAGPIE_ENCRYPTION_KEY'] = saved_encryption
         key_barrier = threading.Barrier(2)
@@ -909,7 +841,7 @@ try:
             assert len(active) == 1 and active[0].id in (1, race_user)
             sessions = session.scalars(select(AdminSession).where(AdminSession.token_hash.in_([f'{1:064x}', f'{2:064x}']))).all()
             assert len(sessions) == 2 and all(item.revoked == (item.user_id != active[0].id) for item in sessions)
-    print('PostgreSQL migrations, accounts, mocked OIDC and Jev, pricing, audit, limits, budgets, routing and retention passed')
+    print('PostgreSQL migrations, accounts, mocked Jev, pricing, audit, limits, budgets, routing and retention passed')
 finally:
     app.dependency_overrides.clear()
     test_engine.dispose()

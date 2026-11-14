@@ -2,7 +2,7 @@
 # Starts and removes only this test's isolated Docker Compose project and volume.
 set -eu
 unset POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL MAGPIE_ADMIN_TOKEN MAGPIE_ENCRYPTION_KEY
-unset MAGPIE_OIDC_ISSUER MAGPIE_OIDC_AUTHORIZATION_URL MAGPIE_OIDC_TOKEN_URL MAGPIE_OIDC_JWKS_URL MAGPIE_OIDC_CLIENT_ID MAGPIE_OIDC_CLIENT_SECRET MAGPIE_OIDC_REDIRECT_URI MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS
+unset MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS
 cd "$(dirname "$0")/../.."
 test_dir=$(mktemp -d /tmp/magpie-ha-load.XXXXXX)
 test_project="magpieload$(date +%s)$$"
@@ -19,13 +19,6 @@ services:
   backend:
     image: magpie-backend:latest
     command: ["uvicorn", "mock_gateway:app", "--host", "0.0.0.0", "--port", "8000"]
-    environment:
-      MAGPIE_OIDC_ISSUER: https://identity.example
-      MAGPIE_OIDC_AUTHORIZATION_URL: https://identity.example/authorize
-      MAGPIE_OIDC_TOKEN_URL: https://identity.example/token
-      MAGPIE_OIDC_JWKS_URL: https://identity.example/jwks
-      MAGPIE_OIDC_CLIENT_ID: magpie-test
-      MAGPIE_OIDC_REDIRECT_URI: https://magpie.example/oidc/callback
     volumes:
       - "$(pwd)/backend/tests/mock_gateway.py:/app/mock_gateway.py:ro"
   frontend:
@@ -45,16 +38,10 @@ if ! python3 backend/tests/ha_load_client.py; then
 fi
 backend_ids=$(compose_test ps -q backend)
 [ "$(printf '%s\n' "$backend_ids" | wc -l | tr -d ' ')" = 2 ]
-exchanges=0
 for id in $backend_ids; do
   for endpoint in embeddings chat/completions decisions; do
     docker logs "$id" 2>&1 | grep -q "POST /v1/$endpoint"
   done
-  docker logs "$id" 2>&1 | grep -q 'POST /auth/oidc/callback'
-  count=$(docker logs "$id" 2>&1 | grep -c 'MOCK_OIDC_EXCHANGE_EXECUTED' || :)
-  exchanges=$((exchanges + count))
 done
-[ "$exchanges" -eq 1 ]
 printf '%s\n' 'Both backend instances served mocked embedding, generation and decision requests.'
-printf '%s\n' 'Both backend instances received OIDC callbacks; exactly one mock exchange occurred.'
 python3 backend/tests/proxy_idle_check.py --http

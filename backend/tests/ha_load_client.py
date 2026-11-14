@@ -175,18 +175,5 @@ assert status == 201
 status, login = request('POST', '/admin/sessions', admin, credentials)
 assert status == 201
 session_token = login['token']
-status, identity = request('POST', '/admin/oidc-identities', session_token,
-                           {'user_id':user['id'], 'subject':'ha-subject'})
-assert status == 201
-status, start = request('POST', '/auth/oidc/start', session_token)
-assert status == 200
-callback = {'state':start['state'], 'browser_secret':start['browser_secret'], 'code':'mock'}
-with ThreadPoolExecutor(max_workers=8) as pool:
-    callbacks = list(pool.map(lambda _: request('POST', '/auth/oidc/callback', session_token, callback), range(8)))
-statuses = [status for status, _ in callbacks]
-assert statuses.count(200) == 1 and statuses.count(400) == 7, statuses
-sso_token = next(body['token'] for status, body in callbacks if status == 200)
-assert request('GET', '/admin/providers', sso_token)[0] == 200
-assert request('DELETE', f"/admin/oidc-identities/{identity['id']}", session_token)[0] == 204
-assert request('GET', '/admin/providers', sso_token)[0] == 401
-print('Concurrent OIDC callback consumed once and linked session revoked after unlink')
+assert request('GET', '/admin/providers', session_token)[0] == 200
+print('Admin account session works through the HA proxy')

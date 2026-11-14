@@ -4,7 +4,7 @@ set -eu
 # Compose prioritizes inherited environment over --env-file; keep test
 # credentials and endpoints isolated even when the caller has a deployment configured.
 unset POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL MAGPIE_ADMIN_TOKEN MAGPIE_ENCRYPTION_KEY
-unset MAGPIE_OIDC_ISSUER MAGPIE_OIDC_AUTHORIZATION_URL MAGPIE_OIDC_TOKEN_URL MAGPIE_OIDC_JWKS_URL MAGPIE_OIDC_CLIENT_ID MAGPIE_OIDC_CLIENT_SECRET MAGPIE_OIDC_REDIRECT_URI MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS
+unset MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS
 cd "$(dirname "$0")/../.."
 test_dir=$(mktemp -d /tmp/magpie-bootstrap.XXXXXX)
 test_project="magpiebootstrap$(date +%s)$$"

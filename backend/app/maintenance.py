@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 from .database import engine
-from .models import AdminSession, LoginRateCounter, OIDCTransaction, RateLimitCounter
+from .models import AdminSession, LoginRateCounter, RateLimitCounter
 
 
 def prune(db: Session) -> dict[str, int]:
@@ -16,9 +16,12 @@ def prune(db: Session) -> dict[str, int]:
         ('rate_limits', RateLimitCounter, RateLimitCounter.window_start),
         ('login_limits', LoginRateCounter, LoginRateCounter.window_start),
         ('expired_sessions', AdminSession, AdminSession.expires_at),
-        ('expired_oidc', OIDCTransaction, OIDCTransaction.expires_at),
     ]:
-        result = db.execute(delete(model).where(column < cutoff))
+        statement = delete(model).where(column < cutoff)
+        if model is AdminSession:
+            # Preserve historical SSO rows even though they no longer authenticate.
+            statement = statement.where(AdminSession.oidc_identity_id.is_(None))
+        result = db.execute(statement)
         counts[name] = result.rowcount
     db.commit()
     return counts

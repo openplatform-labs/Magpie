@@ -30,6 +30,33 @@ def context(monkeypatch):
 def admin():
     return {'Authorization': 'Bearer ' + 'a' * 40}
 
+def test_removed_sso_routes_and_legacy_sessions_are_inactive_without_deleting_data(context):
+    from datetime import datetime, timedelta, timezone
+    from app.maintenance import prune
+    from app.models import AdminSession, OIDCIdentity
+    from app.security import hash_key
+    client, db = context
+    created = client.post('/admin/users', headers=admin(), json={'username':'legacy-admin','password':'valid test password'})
+    assert created.status_code == 201
+    token = 'mga_legacy-test-session'
+    with Session(db) as session:
+        identity = OIDCIdentity(issuer='https://legacy.example', subject='legacy', user_id=created.json()['id'])
+        session.add(identity); session.flush()
+        session.add(AdminSession(user_id=identity.user_id, oidc_identity_id=identity.id,
+                                 token_hash=hash_key(token), expires_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+        session.add(AdminSession(user_id=identity.user_id, oidc_identity_id=identity.id,
+                                 token_hash=hash_key('mga_old_sso'), expires_at=datetime.now(timezone.utc) - timedelta(days=3)))
+        session.add(AdminSession(user_id=identity.user_id, token_hash=hash_key('mga_old_local'),
+                                 expires_at=datetime.now(timezone.utc) - timedelta(days=3)))
+        session.commit(); identity_id = identity.id
+    assert client.get('/auth/oidc/config').status_code == 404
+    assert client.post('/auth/oidc/start').status_code == 404
+    assert client.get('/admin/providers', headers={'Authorization':'Bearer '+token}).status_code == 401
+    with Session(db) as session:
+        assert prune(session)['expired_sessions'] == 1
+        assert session.get(OIDCIdentity, identity_id) is not None
+        assert session.query(AdminSession).filter_by(oidc_identity_id=identity_id).count() == 2
+
 def test_decrypt_existing_provider_key_after_cryptography_upgrade(monkeypatch):
     # Synthetic fixture generated using cryptography 47.0.0; never a real key.
     from app.security import decrypt_secret
@@ -153,7 +180,6 @@ def test_sensitive_responses_are_not_cacheable(context, monkeypatch):
     assert response.status_code == 201 and response.json()['key'].startswith('mgp_')
     assert 'no-store' in response.headers['cache-control']
     assert 'no-store' in client.get('/admin/api-keys').headers['cache-control']
-    assert 'no-store' in client.post('/auth/oidc/start').headers['cache-control']
     assert 'cache-control' not in client.get('/api/catalog').headers
     async def fake(config, data):
         async def chunks():
@@ -1837,18 +1863,18 @@ def test_encryption_key_rotation_is_atomic(context, monkeypatch):
 def test_encryption_rotation_preserves_pending_sso_and_rejects_mixed_keys(context, monkeypatch):
     import os
     from datetime import datetime, timedelta, timezone
-    from app import oidc
     from app.models import OIDCTransaction
     from app.rotate_key import rotate
-    from app.security import hash_key
     client, db = context
     provider_id, _, _ = configure(client)
     old = os.environ['MAGPIE_ENCRYPTION_KEY']
     new = Fernet.generate_key().decode()
-    settings = oidc.OIDCConfig('https://id.example','https://id.example/auth','https://id.example/token','https://id.example/keys','client','https://app.example/callback',None)
+    state_hash = 'legacy-state'
     with Session(db) as session:
-        started = oidc.start(session, settings)
-        state_hash = hash_key(started['state'])
+        session.add(OIDCTransaction(state_hash=state_hash, browser_hash='x', nonce_hash='x',
+            encrypted_verifier=Fernet(old.encode()).encrypt(b'legacy-verifier').decode(),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), used=False))
+        session.commit()
         original_provider = session.get(ProviderConnection, provider_id).encrypted_api_key
         original_verifier = session.get(OIDCTransaction, state_hash).encrypted_verifier
         alien = Fernet.generate_key()
@@ -1865,9 +1891,7 @@ def test_encryption_rotation_preserves_pending_sso_and_rejects_mixed_keys(contex
         session.commit()
         assert rotate(session, old, new) == 1
         assert Fernet(new.encode()).decrypt(session.get(ProviderConnection, provider_id).encrypted_api_key.encode()) == b'provider-secret'
-        monkeypatch.setenv('MAGPIE_ENCRYPTION_KEY', new)
-        verifier, _ = oidc.consume(session, started['state'], started['browser_secret'])
-        assert verifier and session.get(OIDCTransaction, state_hash).used is True
+        assert Fernet(new.encode()).decrypt(session.get(OIDCTransaction, state_hash).encrypted_verifier.encode()) == b'legacy-verifier'
         assert session.get(OIDCTransaction, 'expired').encrypted_verifier == expired_verifier
 
 
@@ -2200,123 +2224,6 @@ def test_retention_preserves_pending_and_budget_history(context, monkeypatch):
         assert session.get(UsageRecord, budgeted_id) is not None
         assert session.get(UsageRecord, 'old-finished') is None
     assert any(x['action'] == 'retention.apply' for x in client.get('/admin/audit', headers=admin()).json())
-
-
-@pytest.fixture
-def oidc_setup(context, monkeypatch):
-    import os
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    import jwt
-    client, db = context
-    for name, value in {
-        'ISSUER':'https://identity.example', 'AUTHORIZATION_URL':'https://identity.example/authorize',
-        'TOKEN_URL':'https://identity.example/token', 'JWKS_URL':'https://identity.example/keys',
-        'CLIENT_ID':'magpie', 'REDIRECT_URI':'https://magpie.example/oidc/callback',
-    }.items(): monkeypatch.setenv('MAGPIE_OIDC_'+name, value)
-    account = {'username':'admin','password':'a good admin password'}
-    assert client.post('/admin/users', headers=admin(), json=account).status_code == 201
-    token = client.post('/admin/sessions', json=account).json()['token']
-    auth = {'Authorization':'Bearer '+token}
-    assert client.post('/admin/oidc-identities', headers=auth, json={'user_id':1,'subject':'subject-1'}).status_code == 201
-    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key(), as_dict=True)
-    public_jwk.update({'kid':'test-key','use':'sig'})
-    return client, db, auth, private, {'keys':[public_jwk]}
-
-
-def test_oidc_pkce_signed_token_binding_and_replay(oidc_setup, monkeypatch):
-    import base64, time
-    from urllib.parse import urlparse, parse_qs
-    import jwt
-    from app import oidc
-    client, _, auth, private, jwks = oidc_setup
-    start = client.post('/auth/oidc/start').json()
-    params = parse_qs(urlparse(start['authorization_url']).query)
-    assert params['code_challenge_method'] == ['S256'] and params['state'] == [start['state']]
-    nonce = params['nonce'][0]
-    async def fake_exchange(settings, code, verifier):
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
-        assert challenge == params['code_challenge'][0] and code == 'fake-code'
-        signed = jwt.encode({'iss':settings.issuer,'sub':'subject-1','aud':settings.client_id,'iat':int(time.time()),'exp':int(time.time())+300,'nonce':nonce}, private, algorithm='RS256', headers={'kid':'test-key'})
-        return signed, jwks
-    monkeypatch.setattr(oidc, 'exchange', fake_exchange)
-    callback = {'state':start['state'], 'browser_secret':start['browser_secret'], 'code':'fake-code'}
-    assert client.post('/auth/oidc/callback', json={**callback, 'browser_secret':'wrong-secret-'*4}).status_code == 400
-    result = client.post('/auth/oidc/callback', json=callback)
-    assert result.status_code == 200 and result.headers['cache-control'] == 'no-store'
-    assert client.get('/admin/providers', headers={'Authorization':'Bearer '+result.json()['token']}).status_code == 200
-    assert client.post('/auth/oidc/callback', json=callback).status_code == 400
-    identity_id = client.get('/admin/oidc-identities', headers=auth).json()[0]['id']
-    assert client.delete('/admin/oidc-identities/'+str(identity_id), headers=auth).status_code == 204
-    assert client.get('/admin/providers', headers={'Authorization':'Bearer '+result.json()['token']}).status_code == 401
-    assert client.get('/admin/providers', headers=auth).status_code == 200
-    assert any(x['action']=='admin.oidc.login' for x in client.get('/admin/audit', headers=auth).json())
-
-
-@pytest.mark.parametrize('claim_change', ['bad_issuer','bad_audience','bad_nonce','expired','unknown_subject','bad_signature','bad_azp'])
-def test_oidc_rejects_invalid_id_tokens(oidc_setup, monkeypatch, claim_change):
-    import time
-    from urllib.parse import urlparse, parse_qs
-    import jwt
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from app import oidc
-    client, _, _, private, jwks = oidc_setup
-    start = client.post('/auth/oidc/start').json()
-    nonce = parse_qs(urlparse(start['authorization_url']).query)['nonce'][0]
-    async def fake_exchange(settings, code, verifier):
-        claims = {'iss':settings.issuer,'sub':'subject-1','aud':settings.client_id,'iat':int(time.time()),'exp':int(time.time())+300,'nonce':nonce}
-        if claim_change == 'bad_issuer': claims['iss'] = 'https://evil.example'
-        if claim_change == 'bad_audience': claims['aud'] = 'another-app'
-        if claim_change == 'bad_nonce': claims['nonce'] = 'another-nonce'
-        if claim_change == 'expired': claims['exp'] = int(time.time())-100
-        if claim_change == 'unknown_subject': claims['sub'] = 'not-linked'
-        if claim_change == 'bad_azp': claims['aud'] = ['magpie','other']; claims['azp'] = 'other'
-        signer = rsa.generate_private_key(public_exponent=65537, key_size=2048) if claim_change == 'bad_signature' else private
-        return jwt.encode(claims, signer, algorithm='RS256', headers={'kid':'test-key'}), jwks
-    monkeypatch.setattr(oidc, 'exchange', fake_exchange)
-    response = client.post('/auth/oidc/callback', json={'state':start['state'],'browser_secret':start['browser_secret'],'code':'fake'})
-    assert response.status_code == (403 if claim_change == 'unknown_subject' else 401)
-    assert 'token' not in response.json()
-
-
-@pytest.mark.parametrize('client_id,secret,expected_basic', [
-    ('magpie', None, None),
-    ('magpie', 'client-secret', 'magpie:client-secret'),
-    ('id: +%', 'secret: +%/한', 'id%3A+%2B%25:secret%3A+%2B%25%2F%ED%95%9C'),
-])
-def test_oidc_real_exchange_with_mock_http_transport(oidc_setup, monkeypatch, client_id, secret, expected_basic):
-    import base64
-    import time
-    from urllib.parse import urlparse, parse_qs
-    import httpx, jwt
-    from app import oidc
-    client, _, _, private, jwks = oidc_setup
-    monkeypatch.setenv('MAGPIE_OIDC_CLIENT_ID', client_id)
-    if secret is not None:
-        monkeypatch.setenv('MAGPIE_OIDC_CLIENT_SECRET', secret)
-    else:
-        monkeypatch.delenv('MAGPIE_OIDC_CLIENT_SECRET', raising=False)
-    start = client.post('/auth/oidc/start').json()
-    nonce = parse_qs(urlparse(start['authorization_url']).query)['nonce'][0]
-    signed = jwt.encode({'iss':'https://identity.example','sub':'subject-1','aud':client_id,'iat':int(time.time()),'exp':int(time.time())+300,'nonce':nonce}, private, algorithm='RS256', headers={'kid':'test-key'})
-    calls = []
-    def handler(request):
-        calls.append((request.method, request.url.path))
-        if request.url.path == '/token':
-            form = parse_qs(request.content.decode())
-            assert form['code'] == ['offline-code'] and form['code_verifier'] and form['client_id'] == [client_id]
-            if expected_basic is None:
-                assert 'authorization' not in request.headers
-            else:
-                scheme, credentials = request.headers['authorization'].split(' ', 1)
-                assert scheme == 'Basic' and base64.b64decode(credentials).decode('ascii') == expected_basic
-            return httpx.Response(200, json={'id_token':signed})
-        if request.url.path == '/keys': return httpx.Response(200, json=jwks)
-        return httpx.Response(404)
-    original = oidc.httpx.AsyncClient
-    monkeypatch.setattr(oidc.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
-    result = client.post('/auth/oidc/callback', json={'state':start['state'],'browser_secret':start['browser_secret'],'code':'offline-code'})
-    assert result.status_code == 200 and calls == [('POST','/token'),('GET','/keys')]
 
 
 def test_route_respects_grants_priority_and_no_retry(context, monkeypatch):

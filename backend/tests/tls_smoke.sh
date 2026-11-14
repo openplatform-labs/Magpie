@@ -2,7 +2,7 @@
 # Locally generated certificate and isolated Compose project; no external calls.
 set -eu
 unset POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL MAGPIE_ADMIN_TOKEN MAGPIE_ENCRYPTION_KEY
-unset MAGPIE_OIDC_ISSUER MAGPIE_OIDC_AUTHORIZATION_URL MAGPIE_OIDC_TOKEN_URL MAGPIE_OIDC_JWKS_URL MAGPIE_OIDC_CLIENT_ID MAGPIE_OIDC_CLIENT_SECRET MAGPIE_OIDC_REDIRECT_URI MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS MAGPIE_TLS_CERT MAGPIE_TLS_KEY MAGPIE_TLS_PORT MAGPIE_TLS_BIND
+unset MAGPIE_ALLOWED_PROVIDER_BASES MAGPIE_PROVIDER_TIMEOUT_SECONDS MAGPIE_TLS_CERT MAGPIE_TLS_KEY MAGPIE_TLS_PORT MAGPIE_TLS_BIND
 cd "$(dirname "$0")/../.."
 test_dir=$(mktemp -d /tmp/magpie-tls.XXXXXX)
 test_project="magpietls$(date +%s)$$"
@@ -39,23 +39,25 @@ if openssl s_client -quiet -tls1_1 -connect localhost:18443 -servername localhos
   printf '%s\n' 'TLS 1.1 unexpectedly accepted' >&2
   exit 1
 fi
-curl --cacert "$test_dir/cert.pem" -fsS -D "$test_dir/headers" 'https://localhost:18443/oidc/callback?code=mock-code' -o /dev/null
+curl --cacert "$test_dir/cert.pem" -fsS -D "$test_dir/headers" 'https://localhost:18443/' -o /dev/null
 grep -qi '^cache-control: no-store' "$test_dir/headers"
 grep -qi '^x-content-type-options: nosniff' "$test_dir/headers"
 grep -qi '^x-frame-options: DENY' "$test_dir/headers"
 grep -qi '^referrer-policy: no-referrer' "$test_dir/headers"
 grep -qi '^content-security-policy:' "$test_dir/headers"
+status=$(curl --cacert "$test_dir/cert.pem" -sS -o /dev/null -w '%{http_code}' 'https://localhost:18443/oidc/callback?code=mock-code')
+[ "$status" = 410 ]
+frontend_id=$(compose_test ps -q frontend)
+if docker logs "$frontend_id" 2>&1 | grep -q 'mock-code'; then
+  printf '%s\n' 'Legacy callback query leaked into access logs' >&2
+  exit 1
+fi
 curl --cacert "$test_dir/cert.pem" -fsS -D "$test_dir/admin-headers" -H 'Authorization: Bearer test-token-012345678901234567890123456789' https://localhost:18443/admin/providers > /dev/null
 grep -qi '^cache-control: no-store' "$test_dir/admin-headers"
 status=$(curl --cacert "$test_dir/cert.pem" -sS -o /dev/null -D "$test_dir/api-headers" -w '%{http_code}' https://localhost:18443/v1/models)
 [ "$status" = 401 ]
 grep -qi '^cache-control: no-store' "$test_dir/api-headers"
-frontend_id=$(compose_test ps -q frontend)
-if docker logs "$frontend_id" 2>&1 | grep -q 'mock-code'; then
-  printf '%s\n' 'Callback query leaked into access logs' >&2
-  exit 1
-fi
 backend_id=$(compose_test ps -q backend)
 [ -z "$(docker port "$backend_id")" ]
 python3 backend/tests/proxy_idle_check.py "$test_dir/cert.pem"
-printf '%s\n' 'TLS 1.2/1.3, security headers, callback log protection, and private backend passed.'
+printf '%s\n' 'TLS 1.2/1.3, security headers, legacy callback protection, and private backend passed.'
