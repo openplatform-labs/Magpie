@@ -3622,7 +3622,8 @@ def test_provider_groups_enforce_model_purpose_without_network(context, monkeypa
         return client.post('/admin/models', headers=admin(), json={'provider_id':provider, 'alias':alias, 'upstream_model':alias, 'operations':operations})
     generative = register(general, 'general-gen', ['generation'])
     assert generative.status_code == 201
-    assert register(general, 'general-embed', ['embedding']).status_code == 201
+    general_embedding = register(general, 'general-embed', ['embedding'])
+    assert general_embedding.status_code == 201
     assert register(general, 'general-mixed', ['generation', 'embedding']).status_code == 422
     embedded = register(embedding, 'embed', ['embedding'])
     assert embedded.status_code == 201
@@ -3632,7 +3633,7 @@ def test_provider_groups_enforce_model_purpose_without_network(context, monkeypa
     assert register(decision, 'jev-gen', ['generation']).status_code == 422
     groups = {item['name']:item['model_group'] for item in client.get('/admin/providers', headers=admin()).json()}
     assert groups == {'general':'general', 'embedding':'embedding', 'decision':'decision'}
-    key = client.post('/admin/api-keys', headers=admin(), json={'name':'purpose-check', 'model_ids':[generative.json()['id'], embedded.json()['id'], jev.json()['id']]}).json()['key']
+    key = client.post('/admin/api-keys', headers=admin(), json={'name':'purpose-check', 'model_ids':[generative.json()['id'], general_embedding.json()['id'], embedded.json()['id'], jev.json()['id']]}).json()['key']
     auth = {'Authorization':'Bearer '+key}
     operations = {
         'generation': ('/v1/chat/completions', {'messages':[{'role':'user', 'content':'test'}]}),
@@ -3645,12 +3646,32 @@ def test_provider_groups_enforce_model_purpose_without_network(context, monkeypa
         raise AssertionError('An incompatible model reached a provider')
     for name in ('completion', 'embedding', 'decision'):
         monkeypatch.setattr(providers, name, unexpected_call)
-    for alias, allowed in [('general-gen','generation'), ('embed','embedding'), ('jev','decision')]:
+    model_operations = [('general-gen','generation'), ('general-embed','embedding'), ('embed','embedding'), ('jev','decision')]
+    for alias, allowed in model_operations:
         for operation, (path, payload) in operations.items():
             if operation != allowed:
                 response = client.post(path, headers=auth, json={'model':alias, **payload})
                 assert response.status_code == 403, (alias, operation, response.text)
     assert not upstream_calls
+    async def generation_call(config, data):
+        upstream_calls.append(('generation', config['model']))
+        return {'choices':[{'index':0, 'message':{'role':'assistant','content':'ok'}, 'finish_reason':'stop'}],
+                'usage':{'prompt_tokens':2,'completion_tokens':1}}
+    async def embedding_call(config, data):
+        upstream_calls.append(('embedding', config['model']))
+        return {'data':[{'index':0,'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2}}
+    async def decision_call(config, data):
+        upstream_calls.append(('decision', config['model']))
+        return {'answers':[{'type':'predicate','name':'ok','probability':0.9}], 'usage':{'input_tokens':2,'output_tokens':1}}
+    monkeypatch.setattr(providers, 'completion', generation_call)
+    monkeypatch.setattr(providers, 'embedding', embedding_call)
+    monkeypatch.setattr(providers, 'decision', decision_call)
+    for alias, operation in model_operations:
+        path, payload = operations[operation]
+        response = client.post(path, headers=auth, json={'model':alias, **payload})
+        assert response.status_code == 200, (alias, response.text)
+    assert upstream_calls == [('generation','openai/general-gen'), ('embedding','openai/general-embed'),
+                              ('embedding','openai/embed'), ('decision','typesafe/jev')]
 
 
 def test_provider_group_change_preserves_models_and_rejects_conflicts(context):
