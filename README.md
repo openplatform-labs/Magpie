@@ -56,7 +56,6 @@ Cerebras, Novita, Synthetic과 SambaNova는 각 공급자의 모델 목록 API�
 - `POST /v1/embeddings`: 임베딩 호출
 - `PUT /admin/models/{id}/capabilities/{operation}/verification`, `GET /admin/models/{id}/verification-history`: 작업별 검증 상태 및 관리자 근거 기록
 - `POST /v1/decisions`: 텍스트·이미지와 predicate·choice·score 질문을 TypeSafe Jev 또는 OpenAI Decisions로 전달
-- `POST /admin/routes`, `PUT /admin/routes/{id}`, `GET /admin/routes`: 모델 라우트 관리
 - `POST /admin/prices`, `GET /admin/prices`: 모델 가격 이력
 - `GET /admin/metrics`, `/admin/usage`, `/admin/usage/requests`: 요청 현황과 작업·기간·모델·키별 집계 및 최근 요청
 - `GET /admin/audit`: 최근 관리자 작업 이력

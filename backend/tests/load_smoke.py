@@ -73,10 +73,7 @@ try:
         limited = client.post('/admin/api-keys', headers=admin, json={'name':'limited','model_ids':[model['id']],'requests_per_minute':10}).json()
         first_data = {'alias':'embed','provider_id':provider['id'],'upstream_model':'fake','operations':['embedding'], 'embedding_space':'load-space','embedding_dimensions':2}
         assert client.put('/admin/models/'+str(model['id']), headers=admin, json=first_data).status_code == 200
-        backup = client.post('/admin/models', headers=admin, json={**first_data,'alias':'backup','upstream_model':'backup'}).json()
-        assert client.post('/admin/prices', headers=admin, json={'model_id':backup['id'],'currency':'USD','basis':'tokens','input_per_million':'10000','output_per_million':'0'}).status_code == 201
-        assert client.post('/admin/routes', headers=admin, json={'alias':'retry-load','operation':'embedding','retry_on_failure':True,'targets':[{'model_id':model['id'],'priority':0},{'model_id':backup['id'],'priority':1}]}).status_code == 201
-        retry_key = client.post('/admin/api-keys', headers=admin, json={'name':'retry-load','model_ids':[model['id'],backup['id']]}).json()
+        retry_key = client.post('/admin/api-keys', headers=admin, json={'name':'no-retry','model_ids':[model['id']]}).json()
 
     async def run_batch(token, size, concurrency, alias='embed'):
         semaphore = asyncio.Semaphore(concurrency)
@@ -135,23 +132,20 @@ try:
         assert session.scalar(select(func.sum(UsageRecord.estimated_cost)).where(UsageRecord.client_key_id == key['id'])) == Decimal('0.02') * total
         assert session.scalar(select(func.count()).select_from(UsageRecord).where(UsageRecord.client_key_id == limited['id'])) == 10
     assert len(calls) == total + 10
+    failure_calls = []
     async def flaky_embedding(config, data):
+        failure_calls.append(config['model'])
         await asyncio.sleep(0.01)
-        if config['model'].endswith('/fake'):
-            raise TimeoutError('mock timeout')
-        return {'model':'mock','data':[{'index':0,'embedding':[0.1,0.2]}],'usage':{'prompt_tokens':2}}
+        raise TimeoutError('mock timeout')
     providers.embedding = flaky_embedding
-    retry_results, elapsed = asyncio.run(run_batch(retry_key['key'], 24, 12, 'retry-load'))
-    assert all(status == 200 for status, _, _ in retry_results), retry_results
+    retry_results, elapsed = asyncio.run(run_batch(retry_key['key'], 24, 12))
+    assert all(status == 504 for status, _, _ in retry_results), retry_results
     with Session(test_engine) as session:
         records = session.scalars(select(UsageRecord).where(UsageRecord.client_key_id == retry_key['id'])).all()
-        roots = {record.root_request_id for record in records}
-        failures = sum(record.status == 'error' for record in records)
-        successes = sum(record.status == 'success' for record in records)
-        assert len(roots) == 24 and successes == 24 and failures >= 1
-        assert len(records) == successes + failures and max(record.attempt_number for record in records) == 2
-        assert sum((record.estimated_cost or Decimal('0')) for record in records) == Decimal('0.02') * successes
-    print(f'retry concurrency=12 requests=24 failures={failures} attempts={len(records)} elapsed_s={elapsed:.3f}')
+        assert len(records) == len(failure_calls) == 24
+        assert len({record.root_request_id for record in records}) == 24
+        assert all(record.status == 'error' and record.attempt_number == 1 for record in records)
+    print(f'no-retry concurrency=12 requests=24 attempts={len(records)} elapsed_s={elapsed:.3f}')
     # PostgreSQL INTEGER is bounded even though Python integers are not.
     # Malformed provider usage must not roll back request finalization or be
     # treated as a reliable cost.

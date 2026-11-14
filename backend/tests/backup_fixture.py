@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from app import providers
 from app.database import engine
 from app.main import app
-from app.models import BudgetAdjustment, BudgetReservation, ClientKey, KeyBudget, ProviderConnection
+from app.models import BudgetAdjustment, BudgetReservation, ClientKey, KeyBudget, ProviderConnection, ModelRoute, RouteTarget
 from app.security import decrypt_secret, hash_key
 
 # Database connections use libpq; provider clients must never reach the network.
@@ -57,6 +57,10 @@ with TestClient(app) as client:
         model = client.post('/admin/models', headers=admin, json={'alias':'backup-model','provider_id':provider['id'],'upstream_model':'mock','operations':['embedding'],'embedding_dimensions':2}).json()
         key = client.post('/admin/api-keys', headers=admin, json={'name':'backup-key','model_ids':[model['id']]}).json()
         with Session(engine()) as db:
+            route = ModelRoute(alias='legacy-backup-route', operation='embedding', active=True, retry_on_failure=True)
+            db.add(route)
+            db.flush()
+            db.add(RouteTarget(route_id=route.id, model_id=model['id'], priority=0, weight=1))
             db.get(ClientKey, key['id']).key_hash = hash_key(TEST_KEY)
             db.get(ProviderConnection, provider['id']).encrypted_api_key = LEGACY_CIPHERTEXT
             db.commit()
@@ -87,6 +91,8 @@ with TestClient(app) as client:
         assert sum(row['status'] == 'success' and row['input_tokens'] is None for row in usage) == 1
         failed = next(row for row in usage if row['status'] == 'error')
         with Session(engine()) as db:
+            route = db.query(ModelRoute).filter_by(alias='legacy-backup-route').one()
+            assert route.retry_on_failure and db.query(RouteTarget).filter_by(route_id=route.id).count() == 1
             legacy = db.query(ClientKey).filter_by(name='backup-legacy-key').one()
             budget = db.get(KeyBudget, legacy.id)
             reservation = db.get(BudgetReservation, failed['request_id'])
@@ -97,7 +103,8 @@ with TestClient(app) as client:
             secret = db.query(ProviderConnection).one().encrypted_api_key
             assert secret == LEGACY_CIPHERTEXT and decrypt_secret(secret) == PROVIDER_KEY
         assert next(item for item in client.get('/admin/api-keys', headers=admin).json() if item['id'] == legacy.id)['legacy_budget'] is True
-        assert client.get('/v1/models', headers={'Authorization':'Bearer '+TEST_KEY}).json()['data'][0]['id'] == 'backup-model'
+        assert client.get('/admin/routes', headers=admin).status_code == 404
+        assert [m['id'] for m in client.get('/v1/models', headers={'Authorization':'Bearer '+TEST_KEY}).json()['data']] == ['backup-model']
         assert client.post('/v1/embeddings', headers={'Authorization':'Bearer '+TEST_KEY}, json={'model':'backup-model','input':'restored'}).status_code == 200
     else:
         raise ValueError('unknown mode')
