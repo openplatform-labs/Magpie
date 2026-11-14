@@ -43,3 +43,7 @@ component.selectDiscovery({...exaone, configured:false}); component.discoverProv
 assert.equal(requests.length, 2);
 console.log('Discovery respects provider selection and sends selected models to the registration form.');
 assert.equal(component.advertisedOperationsLabel(['generation', 'embedding']), '생성형 / 임베딩');
+const chutes = {id:3, name:'Chutes', provider_type:'chutes', model_group:'general' as const, configured:false, active:true};
+component.selectDiscovery(chutes); component.discoverProvider();
+assert.equal(requests.length, 3);
+assert.equal(requests[2].url, '/admin/providers/3/discover');

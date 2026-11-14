@@ -86,11 +86,16 @@ DISCOVERY_BASES = {
     'groq': 'https://api.groq.com/openai/v1',
     'cerebras': 'https://api.cerebras.ai/v1',
     'novita': 'https://api.novita.ai/openai/v1',
+    'chutes': 'https://llm.chutes.ai/v1',
+    'synthetic': 'https://api.synthetic.new/openai/v1',
+    'sambanova': 'https://api.sambanova.ai/v1',
     'together_ai': 'https://api.together.xyz/v1',
     # Fireworks' public account, not the caller's private account catalog.
     'fireworks_ai': 'https://api.fireworks.ai/v1/accounts/fireworks',
     'mistral': 'https://api.mistral.ai/v1',
 }
+
+PUBLIC_DISCOVERY_PROVIDERS = frozenset({'chutes'})
 
 
 class DiscoveryError(Exception):
@@ -98,7 +103,7 @@ class DiscoveryError(Exception):
         self.code = code
 
 
-async def discover_models(provider_type: str, secret: str, custom_base: str | None = None):
+async def discover_models(provider_type: str, secret: str | None, custom_base: str | None = None):
     """Fetch bounded pages on explicit request; never follow redirects."""
     if provider_type in CODING_PROVIDERS:
         raise DiscoveryError('unsupported')
@@ -111,7 +116,11 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
         base = DISCOVERY_BASES.get(provider_type) or PROVIDERS[provider_type]['base']
     if not base:
         raise DiscoveryError('unsupported')
-    headers = {'Authorization': 'Bearer ' + secret, 'Accept': 'application/json'}
+    headers = {'Accept': 'application/json'}
+    if provider_type not in PUBLIC_DISCOVERY_PROVIDERS:
+        if not secret:
+            raise DiscoveryError('authentication')
+        headers['Authorization'] = 'Bearer ' + secret
     if provider_type == 'anthropic':
         headers = {'x-api-key': secret, 'anthropic-version': '2023-06-01', 'Accept':'application/json'}
     elif provider_type == 'gemini':

@@ -3497,6 +3497,8 @@ def test_documented_api_examples_with_mock_providers(context, monkeypatch):
     ('exaone', 'https://api.exaone.ai/v1/models', 'authorization', {'data':[{'id':'k-exaone-test'}]}, 'k-exaone-test'),
     ('cerebras', 'https://api.cerebras.ai/v1/models', 'authorization', {'data':[{'id':'cerebras-test'}]}, 'cerebras-test'),
     ('novita', 'https://api.novita.ai/openai/v1/models', 'authorization', {'data':[{'id':'vendor/novita-test'}]}, 'vendor/novita-test'),
+    ('synthetic', 'https://api.synthetic.new/openai/v1/models', 'authorization', {'data':[{'id':'hf:vendor/model'}]}, 'hf:vendor/model'),
+    ('sambanova', 'https://api.sambanova.ai/v1/models', 'authorization', {'data':[{'id':'samba-test'}]}, 'samba-test'),
     ('fireworks_ai', 'https://api.fireworks.ai/v1/accounts/fireworks/models', 'authorization', {'models':[{'name':'accounts/fireworks/models/test','displayName':'Test'}]}, 'accounts/fireworks/models/test'),
 ])
 def test_provider_discovery_uses_bounded_mock_transport(context, monkeypatch, kind, path, header, payload, expected):
@@ -3912,3 +3914,25 @@ def test_together_model_catalog_and_explicit_types_without_network(context, monk
     assert 'advertised_operations' not in results['example/image']
     assert 'advertised_operations' not in results['example/unknown']
     assert len(seen) == 1
+
+
+def test_chutes_public_catalog_never_sends_or_requires_a_key(context, monkeypatch):
+    import httpx
+    client, engine = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'chutes-public','provider_type':'chutes'}).json()['id']
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert str(request.url) == 'https://llm.chutes.ai/v1/models'
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, json={'data':[{'id':'vendor/public-model'}]})
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    result = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert result.status_code == 200 and result.json()['models'][0]['id'] == 'vendor/public-model'
+    # An unreadable saved key must not affect or be sent to a public catalog.
+    with Session(engine) as session:
+        session.get(ProviderConnection, provider).encrypted_api_key = 'not-a-ciphertext'
+        session.commit()
+    assert client.post(f'/admin/providers/{provider}/discover', headers=admin()).status_code == 200
+    assert len(requests) == 2

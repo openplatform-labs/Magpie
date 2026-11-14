@@ -1094,12 +1094,15 @@ async def discover_provider_models(provider_id: int, db: DB, actor: Admin):
     provider = db.get(ProviderConnection, provider_id)
     if not provider or not provider.active:
         raise HTTPException(404, 'Provider is not active')
-    if not provider.encrypted_api_key:
+    public_catalog = provider.provider_type in providers.PUBLIC_DISCOVERY_PROVIDERS
+    if not provider.encrypted_api_key and not public_catalog:
         raise HTTPException(400, 'provider_key_missing')
-    try:
-        secret = decrypt_secret(provider.encrypted_api_key)
-    except Exception:
-        raise HTTPException(503, 'provider_key_unavailable') from None
+    secret = None
+    if not public_catalog:
+        try:
+            secret = decrypt_secret(provider.encrypted_api_key)
+        except Exception:
+            raise HTTPException(503, 'provider_key_unavailable') from None
     provider_type, base = provider.provider_type, provider.base_url
     db.rollback()  # Do not hold a DB transaction open during the external request.
     try:
