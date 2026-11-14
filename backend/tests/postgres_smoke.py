@@ -25,7 +25,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from app.main import AdjustmentIn, CapabilityVerificationIn, ModelIn, ProviderGroupIn, RouteIn, SecretIn, adjust_budget, app, change_provider_key, create_model, create_route, db_session, lock_catalog, rotate_provider_key, set_capability_verification, set_provider_model_group, update_model
-from app.models import AdminSession, AdminUser, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, RouteTarget, UsageRecord
+from app.models import AdminSession, AdminUser, AuditLog, BootstrapLock, BudgetReservation, ClientKey, KeyBudget, ModelCircuit, ModelRoute, RouteTarget, UsageRecord
 from app.rate_limit import consume
 from app.database import runtime_engine
 from app.recover_admin import recover
@@ -806,6 +806,39 @@ try:
         assert sorted(issue_results) == [201, 409], issue_results
         with Session(test_engine) as session:
             assert len(session.scalars(select(ClientKey).where(ClientKey.name == 'deduplicated')).all()) == 1
+        # Admin model tests have no client key: exercise the nullable usage
+        # record and audit entry against PostgreSQL for every supported task.
+        current = client.post('/admin/sessions', json={'username':user['username'], 'password':'recovered test password'})
+        assert current.status_code == 201
+        test_admin = {'Authorization':'Bearer ' + current.json()['token']}
+        async def test_generation(config, data):
+            return {'choices':[{'index':0, 'message':{'role':'assistant','content':'OK'}, 'finish_reason':'stop'}],
+                    'usage':{'prompt_tokens':2,'completion_tokens':1}}
+        async def test_embedding(config, data):
+            return {'data':[{'index':0, 'embedding':[0.1,0.2]}], 'usage':{'prompt_tokens':2}}
+        async def test_decision(config, data):
+            return {'answers':[{'type':'predicate', 'name':'test', 'probability':0.9}],
+                    'usage':{'input_tokens':2,'output_tokens':1}}
+        for operation, provider_type, mock in [('generation','exaone',test_generation),
+                                                ('embedding','exaone',test_embedding),
+                                                ('decision','typesafe',test_decision)]:
+            connection = client.post('/admin/providers', headers=test_admin, json={
+                'name':'admin-test-' + operation, 'provider_type':provider_type, 'api_key':'fake'}).json()
+            registered = client.post('/admin/models', headers=test_admin, json={
+                'alias':'admin-test-' + operation, 'provider_id':connection['id'],
+                'upstream_model':'mock-model', 'operations':[operation]}).json()
+            previous = getattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation])
+            setattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation], mock)
+            try:
+                response = client.post(f"/admin/models/{registered['id']}/test", headers=test_admin, json={'operation':operation})
+            finally:
+                setattr(providers, {'generation':'completion','embedding':'embedding','decision':'decision'}[operation], previous)
+            assert response.status_code == 200, response.text
+            with Session(test_engine) as session:
+                usage = session.get(UsageRecord, response.json()['request_id'])
+                assert usage is not None and usage.client_key_id is None and usage.model_id == registered['id']
+                assert usage.operation == operation and usage.status == 'success' and usage.input_tokens == 2
+                assert session.scalar(select(AuditLog.id).where(AuditLog.action == 'model.test', AuditLog.target_id == str(registered['id'])))
         # Two operators can deactivate different users at the same time. The
         # shared bootstrap row must serialize the final-active-user check.
         with Session(test_engine) as session:
