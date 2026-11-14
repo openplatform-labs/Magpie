@@ -21,7 +21,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 
 /* Management console */
 .console-shell { min-height: 100vh; background: #f5f7f9; color: #1b2c3b; }
-.topbar { height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 32px; background: #10273a; color: #fff; }
+.topbar { position: sticky; top: 0; z-index: 1001; height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 32px; background: #10273a; color: #fff; }
 .brand-block { display: flex; align-items: center; gap: 12px; letter-spacing: .12em; font-size: 15px; }
 .brand-mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: #7bd0bf; color: #102f32; font-weight: 800; letter-spacing: 0; }
 .brand-caption { color: #aac0cd; font-size: 10px; letter-spacing: .14em; }
