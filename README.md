@@ -12,7 +12,9 @@ Magpie는 생성형·판단형·임베딩 모델을 관리하기 위한 AI 게�
 
 모델 등록 후 모델 화면의 ‘호출 테스트’에서 명시적으로 실행하면 짧은 생성·임베딩·판단 요청을 공급자에 한 번 보냅니다. 실제 호출이므로 과금될 수 있으며 클라이언트 키 예산은 적용되지 않습니다. 관리자의 테스트 요청은 사용량과 감사 이력에 별도로 표시하며, 공급자 응답 본문과 키는 저장하지 않습니다. 호출이 실패하거나 시간 초과되어도 공급자가 처리했을 수 있습니다. 개발 테스트는 모의 공급자로만 진행합니다.
 
-Gemini 목록에서 공급자가 `generateContent` 또는 `embedContent`를 명시하면 해당 용도를 표시합니다. 이 표시는 목록 응답의 참고 정보이며, 등록자가 실제 사용할 용도를 직접 선택합니다. 다른 공급자나 메서드 정보가 없는 모델의 용도는 추측하지 않습니다.
+Gemini 목록에서 공급자가 `generateContent` 또는 `embedContent`를 명시하면 해당 용도를 표시합니다. 이 표시는 목록 응답의 참고 정보이며, 등록자가 실제 사용할 용도를 직접 선택합니다. 기능 정보가 없는 모델의 용도는 추측하지 않습니다.
+
+Together AI 목록은 [기존 공식 Python SDK의 모델 목록 계약](https://github.com/togethercomputer/together-python/blob/main/src/together/resources/models.py)을 지원합니다. 목록에 `chat` 또는 `embedding` 유형이 명시된 경우에만 해당 용도를 참고 정보로 표시합니다. 공급자가 구형 목록 API를 중단했거나 다른 응답을 반환하면 모델 ID를 직접 등록하십시오.
 
 Cerebras와 Novita는 각각 공식 [Cerebras 모델 목록 API](https://inference-docs.cerebras.ai/api-reference/models/list-models)와 [Novita 모델 목록 API](https://docs.novita.ai/api-reference/model-apis-llm-list-models)를 사용합니다. Fireworks는 [계정별 모델 목록 API](https://docs.fireworks.ai/api-reference/list-models)에서 공개 `fireworks` 계정만 조회하므로 개인 계정 모델은 직접 등록해야 합니다. 이 공급자들의 실제 목록·추론 호출은 테스트하지 않았습니다.
 

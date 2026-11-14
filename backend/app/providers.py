@@ -86,6 +86,7 @@ DISCOVERY_BASES = {
     'groq': 'https://api.groq.com/openai/v1',
     'cerebras': 'https://api.cerebras.ai/v1',
     'novita': 'https://api.novita.ai/openai/v1',
+    'together_ai': 'https://api.together.xyz/v1',
     # Fireworks' public account, not the caller's private account catalog.
     'fireworks_ai': 'https://api.fireworks.ai/v1/accounts/fireworks',
     'mistral': 'https://api.mistral.ai/v1',
@@ -142,7 +143,10 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                         payload = json.loads(b''.join(chunks))
                     except (ValueError, UnicodeError, RecursionError):
                         raise DiscoveryError('invalid_response') from None
-                    items = payload.get('models' if provider_type in ('typesafe', 'gemini', 'fireworks_ai') else 'data') if isinstance(payload, dict) else None
+                    if provider_type == 'together_ai' and isinstance(payload, list):
+                        items, payload = payload, {}
+                    else:
+                        items = payload.get('models' if provider_type in ('typesafe', 'gemini', 'fireworks_ai') else 'data') if isinstance(payload, dict) else None
                     if not isinstance(items, list):
                         raise DiscoveryError('invalid_response')
                     for item in items:
@@ -157,7 +161,7 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                         if not isinstance(name, str) or not name or len(name) > 200 or name in seen:
                             continue
                         seen.add(name)
-                        label = item.get('displayName') if provider_type in ('gemini', 'fireworks_ai') else item.get('name')
+                        label = item.get('displayName') if provider_type in ('gemini', 'fireworks_ai') else item.get('display_name') if provider_type == 'together_ai' else item.get('name')
                         model = {'id': name, 'name': label[:200] if isinstance(label, str) else name}
                         # Only surface documented, explicitly advertised methods;
                         # absence of metadata must not imply lack of support.
@@ -167,6 +171,8 @@ async def discover_models(provider_type: str, secret: str, custom_base: str | No
                                          (('generateContent', 'generation'), ('embedContent', 'embedding')) if method in methods]
                             if available:
                                 model['advertised_operations'] = available
+                        if provider_type == 'together_ai' and item.get('type') in ('chat', 'embedding'):
+                            model['advertised_operations'] = ['generation' if item['type'] == 'chat' else 'embedding']
                         models.append(model)
                     more = bool(payload.get('has_more') or payload.get('nextPageToken'))
                     if partial or not more:

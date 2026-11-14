@@ -3882,3 +3882,33 @@ def test_admin_model_test_success_not_overwritten_by_cancellation_during_finaliz
         release.set()
     assert statuses == ['success']
     assert client.get('/admin/usage/requests', headers=admin()).json()[0]['status'] == 'success'
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_together_model_catalog_and_explicit_types_without_network(context, monkeypatch, wrapped):
+    import httpx
+    client, _ = context
+    provider = client.post('/admin/providers', headers=admin(), json={'name':'together','provider_type':'together_ai','api_key':'synthetic'}).json()['id']
+    items = [
+        {'id':'example/chat','display_name':'Chat','type':'chat'},
+        {'id':'example/embed','display_name':'Embedding','type':'embedding'},
+        {'id':'example/image','type':'image'},
+        {'id':'example/unknown'},
+    ]
+    seen = []
+    def handler(request):
+        seen.append(request)
+        assert str(request.url) == 'https://api.together.xyz/v1/models'
+        assert request.headers['authorization'] == 'Bearer synthetic'
+        return httpx.Response(200, json={'data':items} if wrapped else items)
+    original = providers.httpx.AsyncClient
+    monkeypatch.setattr(providers.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    response = client.post(f'/admin/providers/{provider}/discover', headers=admin())
+    assert response.status_code == 200
+    results = {item['id']:item for item in response.json()['models']}
+    assert results['example/chat']['name'] == 'Chat'
+    assert results['example/chat']['advertised_operations'] == ['generation']
+    assert results['example/embed']['advertised_operations'] == ['embedding']
+    assert 'advertised_operations' not in results['example/image']
+    assert 'advertised_operations' not in results['example/unknown']
+    assert len(seen) == 1
