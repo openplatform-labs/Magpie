@@ -11,8 +11,8 @@ export class SessionLifecycle {
 
 // Do not cancel the server-side session revocation itself on a later login.
 export const sessionCancellationInterceptor: HttpInterceptorFn = (request, next) => {
-  const protectedRequest = request.url.startsWith('/admin/') || request.url.startsWith('/auth/oidc/');
-  if (!protectedRequest || request.url === '/admin/sessions/current' || request.url === '/auth/oidc/config') return next(request);
+  const protectedRequest = request.url.startsWith('/admin/');
+  if (!protectedRequest || request.url === '/admin/sessions/current') return next(request);
   return next(request).pipe(takeUntil(inject(SessionLifecycle).ended$));
 };
 

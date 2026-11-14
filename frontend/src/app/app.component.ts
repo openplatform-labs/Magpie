@@ -19,7 +19,6 @@ interface UsageSummary {operation: string; status: string; model_id: number; cli
 interface UsageRequest { provider_id_snapshot: number | null; provider_name_snapshot: string | null; provider_type_snapshot: string | null; upstream_model_snapshot: string | null;request_id: string; root_request_id: string; attempt_number: number; client_key_id: number | null; model_id: number; operation: string; requested_alias: string | null; status: string; started_at: string; estimated_cost: string | null; currency: string | null; resolved_at: string | null; resolution_actor: string | null; resolution_note: string | null}
 interface AuditEntry {id: number; created_at: string; actor: string; action: string; target_type: string; target_id: string}
 interface ManagedKey { id: number; name: string; prefix: string; active: boolean; requests_per_minute: number | null; expires_at: string | null; model_ids: number[] }
-interface OIDCStart {authorization_url: string; state: string; browser_secret: string}
 interface AdminSession {token: string; expires_at: string}
 interface IssuedKey { id: number; key: string }
 
@@ -30,7 +29,7 @@ interface IssuedKey { id: number; key: string }
     <header class="topbar"><div class="brand-block"><span class="brand-mark">M</span><strong>MAGPIE</strong><span class="brand-caption">MODEL GATEWAY</span></div><button *ngIf="loggedIn" class="top-logout" type="button" [disabled]="drawer !== null" (click)="logout()">로그아웃</button></header>
     <div class="login-layout" *ngIf="!loggedIn">
       <div class="login-heading"><span class="overline">MAGPIE CONSOLE</span><h1>모델을 연결하는<br>하나의 공간.</h1><p>생성형, 판단형, 임베딩 모델을 관리합니다.</p></div>
-      <div class="login-card"><h2>관리자 로그인</h2><p>관리자 계정으로 시작하세요.</p><form ngNativeValidate (ngSubmit)="loginAccount()"><label>계정 이름<input name="loginUsername" [(ngModel)]="loginUsername" autocomplete="username" required></label><label>비밀번호<input type="password" name="loginPassword" [(ngModel)]="loginPassword" autocomplete="current-password" required></label><button class="btn btn-primary" type="submit">로그인</button></form><button *ngIf="oidcEnabled" class="btn btn-link" type="button" (click)="startSso()">SSO 로그인</button><details><summary>처음 설정하시나요?</summary><p>초기 관리자 토큰으로 연결한 뒤 관리자 계정을 생성하세요.</p><form ngNativeValidate (ngSubmit)="authenticate()"><label for="token">초기 관리자 토큰</label><input id="token" type="password" name="token" [(ngModel)]="tokenInput" autocomplete="off" required><button class="btn btn-sm" type="submit">연결</button></form></details><p class="error" *ngIf="error" role="alert">{{error}}</p><p class="error" *ngIf="logoutWarning" role="alert">{{logoutWarning}}</p></div>
+      <div class="login-card"><h2>관리자 로그인</h2><p>관리자 계정으로 시작하세요.</p><form ngNativeValidate (ngSubmit)="loginAccount()"><label>계정 이름<input name="loginUsername" [(ngModel)]="loginUsername" autocomplete="username" required></label><label>비밀번호<input type="password" name="loginPassword" [(ngModel)]="loginPassword" autocomplete="current-password" required></label><button class="btn btn-primary" type="submit">로그인</button></form><details><summary>처음 설정하시나요?</summary><p>초기 관리자 토큰으로 연결한 뒤 관리자 계정을 생성하세요.</p><form ngNativeValidate (ngSubmit)="authenticate()"><label for="token">초기 관리자 토큰</label><input id="token" type="password" name="token" [(ngModel)]="tokenInput" autocomplete="off" required><button class="btn btn-sm" type="submit">연결</button></form></details><p class="error" *ngIf="error" role="alert">{{error}}</p><p class="error" *ngIf="logoutWarning" role="alert">{{logoutWarning}}</p></div>
     </div>
     <div class="workspace" *ngIf="loggedIn">
       <nav class="sidebar" aria-label="관리 메뉴"><p>WORKSPACE</p><button type="button" [class.selected]="activePage === 'overview'" [attr.aria-current]="activePage === 'overview' ? 'page' : null" (click)="activePage = 'overview'">개요</button><button type="button" [class.selected]="activePage === 'providers'" [attr.aria-current]="activePage === 'providers' ? 'page' : null" (click)="activePage = 'providers'">공급자</button><button type="button" [class.selected]="activePage === 'models'" [attr.aria-current]="activePage === 'models' ? 'page' : null" (click)="activePage = 'models'">모델</button><button type="button" [class.selected]="activePage === 'keys'" [attr.aria-current]="activePage === 'keys' ? 'page' : null" (click)="activePage = 'keys'">API 키</button><button type="button" [class.selected]="activePage === 'activity'" [attr.aria-current]="activePage === 'activity' ? 'page' : null" (click)="activePage = 'activity'">사용량 · 감사</button></nav>
@@ -101,7 +100,6 @@ export class AppComponent implements OnInit {
   private groupEditVersion = 0;
   private discoveryVersion = 0;
   models: Model[] = []; connections: Connection[] = []; keys: ManagedKey[] = []; rotateId: number | null = null; rotateSecret = '';
-  oidcEnabled = false;
   token = ''; tokenInput = ''; loginUsername = ''; loginPassword = ''; newUsername = ''; newPassword = ''; loggedIn = false; error = ''; message = ''; issuedKey = ''; logoutWarning = '';
   readonly managementTimeoutMs = 60000;
   providerSaving = false; providerKeySaving = false;
@@ -134,16 +132,7 @@ export class AppComponent implements OnInit {
   private headers() { return { Authorization: `Bearer ${this.token}` }; }
   ngOnInit(): void {
     this.loadCatalog();
-    this.http.get<{enabled: boolean}>('/auth/oidc/config').subscribe({next: data => this.update(() => {this.oidcEnabled = data.enabled;})});
-    if (window.location.pathname === '/oidc/callback') {
-      const parameters = new URLSearchParams(window.location.search);
-      const state = parameters.get('state'); const code = parameters.get('code');
-      window.history.replaceState(null, '', '/');
-      if (!state || !code) { this.error = 'SSO 응답이 올바르지 않습니다.'; return; }
-      const storageKey = 'magpie_oidc_' + state; const secret = sessionStorage.getItem(storageKey); sessionStorage.removeItem(storageKey);
-      if (!secret) { this.error = '이 브라우저에서 시작한 SSO 요청이 아닙니다.'; return; }
-      this.http.post<AdminSession>('/auth/oidc/callback', {state, code, browser_secret: secret}).subscribe({next: data => {this.token = data.token; this.login();}, error: () => this.update(() => this.error = 'SSO 로그인에 실패했습니다.')});
-    }
+
   }
   loadCatalog(): void {
     if (this.catalogLoading) return;
@@ -153,7 +142,6 @@ export class AppComponent implements OnInit {
       error: () => this.update(() => {this.catalogError = true; this.catalogLoading = false;})
     });
   }
-  startSso(): void { this.http.post<OIDCStart>('/auth/oidc/start', {}).subscribe({next: data => {sessionStorage.setItem('magpie_oidc_' + data.state, data.browser_secret); window.location.assign(data.authorization_url);}, error: () => this.update(() => this.error = 'SSO 로그인을 시작하지 못했습니다.')}); }
   login(): void { this.error = ''; this.http.get<Connection[]>('/admin/providers', {headers: this.headers()}).subscribe({next: data => { this.connections = data; if (this.discoveryProvider) {const current = data.find(p => p.id === this.discoveryProvider?.id); if (current) this.selectDiscovery(current); else this.discoveryProvider = null;} this.loggedIn = true; this.refreshModels(); this.refreshKeys(); this.refreshObservability(); this.cdr.markForCheck(); }, error: () => { this.logout(); this.error = '관리자 인증에 실패했습니다.'; this.cdr.markForCheck(); }}); }
   authenticate(): void { const candidate = this.tokenInput; this.logout(); this.token = candidate; this.login(); }
   logout(): void {

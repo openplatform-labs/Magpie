@@ -18,9 +18,8 @@ function request(url: string) {
 }
 
 const oldModels = request('/admin/models');
-const oldLogin = request('/auth/oidc/callback');
+const oldLogin = request('/admin/sessions');
 const publicCatalog = request('/api/catalog');
-const publicSsoConfig = request('/auth/oidc/config');
 const revocation = request('/admin/sessions/current');
 lifecycle.end();
 assert(oldModels.isComplete() && oldLogin.isComplete());
@@ -28,9 +27,7 @@ oldModels.source.next(new HttpResponse({ body: 'old models' }));
 oldLogin.source.next(new HttpResponse({ body: 'old login' }));
 assert.equal(oldModels.values.length, 0);
 assert.equal(oldLogin.values.length, 0);
-assert(!publicCatalog.isComplete() && !publicSsoConfig.isComplete() && !revocation.isComplete());
-publicSsoConfig.source.next(new HttpResponse({ body: {enabled:true} }));
-assert.equal(publicSsoConfig.values.length, 1);
+assert(!publicCatalog.isComplete() && !revocation.isComplete());
 revocation.source.next(new HttpResponse({ status: 204 }));
 assert.equal(revocation.values.length, 1);
 
@@ -39,7 +36,7 @@ newModels.source.next(new HttpResponse({ body: 'new models' }));
 assert.equal(newModels.values.length, 1);
 lifecycle.end();
 assert(newModels.isComplete());
-console.log('Session transitions cancel stale admin and login responses without cancelling revocation or public SSO configuration.');
+console.log('Session transitions cancel stale admin and login responses without cancelling revocation or public catalog requests.');
 
 let warnings = 0;
 const warn = () => warnings++;
