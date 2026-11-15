@@ -153,8 +153,13 @@ def db_session():
 
 
 DB = Annotated[Session, Depends(db_session)]
-def admin_auth(request: Request, db: DB, authorization: str | None = Header(default=None)) -> str:
+async def admin_auth(request: Request, db: DB, authorization: str | None = Header(default=None)) -> str:
     raw = authorization.removeprefix("Bearer ") if authorization and authorization.startswith("Bearer ") else ""
+    if raw.startswith('mgd_'):
+        if len(raw) > 4096:
+            raise HTTPException(401, "Invalid credentials")
+        from .trusted_proxy import authenticate
+        return await authenticate(request, db, raw[4:])
     if len(raw) > 512:
         raise HTTPException(401, "Invalid credentials")
     session = db.scalar(select(AdminSession).join(AdminUser, AdminSession.user_id == AdminUser.id).where(
@@ -176,6 +181,21 @@ def admin_auth(request: Request, db: DB, authorization: str | None = Header(defa
 
 
 Admin = Annotated[str, Depends(admin_auth)]
+
+
+@app.get('/admin/proxy-requests/{request_id}')
+def delegated_request(request_id: str, request: Request, db: DB, _: Admin):
+    from .models import TrustedProxyRequest
+    claims = getattr(request.state, 'proxy_claims', None)
+    row = db.get(TrustedProxyRequest, request_id)
+    if not claims or not row or row.subject != claims['sub'] or row.issuer != claims['iss']:
+        raise HTTPException(404, 'Delegated request not found')
+    audits = db.scalars(select(AuditLog).where(AuditLog.proxy_request_id == request_id).order_by(AuditLog.id)).all()
+    return {'request_id': row.id, 'state': 'consumed', 'method': row.method, 'target': row.target,
+            'body_sha256': row.body_sha256,
+            'audits': [{'id': entry.id, 'action': entry.action, 'target_type': entry.target_type,
+                        'target_id': entry.target_id} for entry in audits],
+            'outcome': 'audit_evidence' if audits else 'unknown'}
 
 
 class StrictModel(BaseModel):
@@ -812,7 +832,8 @@ def ready():
             if current_revision != ScriptDirectory.from_config(config).get_current_head():
                 raise HTTPException(503, "Database migration is required")
             admin_exists = connection.execute(text("SELECT EXISTS (SELECT 1 FROM admin_users LIMIT 1)")).scalar_one()
-        if not admin_exists and not valid_bootstrap_token(os.environ.get('MAGPIE_ADMIN_TOKEN', '')):
+        from .trusted_proxy import configuration as proxy_configuration
+        if not admin_exists and proxy_configuration() is None and not valid_bootstrap_token(os.environ.get('MAGPIE_ADMIN_TOKEN', '')):
             raise HTTPException(503, 'Admin authentication is not configured')
         return {"status": "ready", "postgres_major": 19}
     except (SQLAlchemyError, RuntimeError):
