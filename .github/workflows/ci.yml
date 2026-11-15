@@ -38,6 +38,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run python -m pytest -q
       - run: PYTHONPATH=. uv run python tests/postgres_smoke.py
+      - run: PYTHONPATH=. uv run python tests/trusted_proxy_postgres.py
       - run: PYTHONPATH=. uv run python tests/price_migration.py
       - run: PYTHONPATH=. MAGPIE_SOAK_SECONDS=5 uv run python tests/load_smoke.py
 

@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
 
 
-def audit(db, action, target_type, target_id, actor="admin_token"):
+def audit(db, action, target_type, target_id, actor=None):
+    actor = actor or db.info.get("admin_actor", "admin_token")
     db.add(AuditLog(created_at=datetime.now(timezone.utc), actor=actor, action=action,
+                    proxy_request_id=db.info.get("proxy_request_id"),
                     target_type=target_type, target_id=str(target_id)))
 
 

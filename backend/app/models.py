@@ -123,6 +123,7 @@ class UsageRecord(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    proxy_request_id: Mapped[str | None] = mapped_column(ForeignKey('trusted_proxy_requests.id'))
     id: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped["datetime"] = mapped_column(DateTime(timezone=True))
     actor: Mapped[str] = mapped_column(String(30))
@@ -266,3 +267,15 @@ class RouteTarget(Base):
     model_id: Mapped[int] = mapped_column(ForeignKey('model_registrations.id'))
     priority: Mapped[int] = mapped_column(Integer)
     weight: Mapped[int] = mapped_column(Integer)
+
+
+class TrustedProxyRequest(Base):
+    __tablename__ = 'trusted_proxy_requests'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    issuer: Mapped[str] = mapped_column(String(256))
+    subject: Mapped[str] = mapped_column(String(36))
+    actor: Mapped[str] = mapped_column(String(30))
+    method: Mapped[str] = mapped_column(String(8))
+    target: Mapped[str] = mapped_column(String(250))
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
